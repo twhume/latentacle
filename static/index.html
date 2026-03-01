@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PicDancer</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="app">
+
+    <header>
+      <h1>PicDancer</h1>
+      <div id="status-badge" class="badge loading">Loading model…</div>
+    </header>
+
+    <!-- ── Left: controls ─────────────────────────── -->
+    <div id="controls">
+
+      <section class="card" id="generate-card">
+        <div class="row">
+          <input id="prompt" type="text" placeholder="Describe the image…" autocomplete="off" />
+          <button id="generate-btn" disabled>Generate</button>
+        </div>
+        <div class="row subtle">
+          <label>Steps
+            <input id="gen-steps" type="range" min="1" max="4" step="1" value="1" />
+            <span id="gen-steps-val">1</span>
+          </label>
+          <label>Seed <input id="seed" type="number" placeholder="random" /></label>
+          <label><select id="gen-size">
+            <option value="512">512 px</option>
+            <option value="768">768 px</option>
+          </select></label>
+        </div>
+      </section>
+
+      <section class="card disabled" id="terms-card">
+        <div class="row">
+          <input id="start-term" type="text" placeholder="Start term…" autocomplete="off" />
+          <input id="end-term"   type="text" placeholder="End term…"   autocomplete="off" />
+          <button id="set-terms-btn" disabled>Set</button>
+        </div>
+      </section>
+
+      <section class="card disabled" id="slider-card">
+        <div id="axis-labels">
+          <span id="label-start">—</span>
+          <span id="label-t">t = 0.00</span>
+          <span id="label-end">—</span>
+        </div>
+        <input id="vector-slider" type="range" min="-200" max="200" step="1" value="0" disabled />
+        <div class="row subtle">
+          <label>Strength
+            <input id="strength-slider" type="range" min="10" max="90" step="5" value="75" />
+            <span id="strength-val">0.75</span>
+          </label>
+          <label>Steps
+            <input id="interp-steps" type="range" min="1" max="4" step="1" value="4" />
+            <span id="interp-steps-val">4</span>
+          </label>
+          <button id="reset-btn" disabled>Reset</button>
+        </div>
+      </section>
+
+    </div>
+
+    <!-- ── Right: image ───────────────────────────── -->
+    <section id="image-section">
+      <div id="image-wrap">
+        <img id="result-img" alt="Generated image" style="display:none" />
+        <div id="image-placeholder"><p>Generate an image to get started</p></div>
+        <div id="spinner">
+          <div class="spin-ring"></div>
+          <p id="spinner-label">Generating…</p>
+        </div>
+      </div>
+      <p id="interp-status"></p>
+    </section>
+
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
