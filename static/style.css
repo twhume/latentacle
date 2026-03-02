@@ -53,6 +53,19 @@ header h1 {
   background-clip: text;
 }
 
+.nav-link {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-decoration: none;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  transition: color 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+.nav-link:hover { color: var(--accent); border-color: var(--accent); }
+
 .badge {
   font-size: 0.65rem;
   font-weight: 600;

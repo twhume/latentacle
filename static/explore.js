@@ -1,55 +1,44 @@
 "use strict";
 
-// ── DOM refs ──────────────────────────────────────
+// ── DOM refs ──────────────────────────────────────────────────────
 const $  = id => document.getElementById(id);
-
-const statusBadge      = $("status-badge");
-const generateBtn      = $("generate-btn");
-const promptInput      = $("prompt");
-const seedInput        = $("seed");
-const genSteps         = $("gen-steps");
-const genStepsVal      = $("gen-steps-val");
-const genSize          = $("gen-size");
-
-const resultImg        = $("result-img");
-const interpStatus     = $("interp-status");
-const imagePlaceholder = $("image-placeholder");
-const spinner          = $("spinner");
-const spinnerLabel     = $("spinner-label");
-
-const axisRow      = $("axis-row");
+const statusBadge  = $("status-badge");
 const leftIn       = $("left-term");
 const rightIn      = $("right-term");
 const bottomIn     = $("bottom-term");
 const topIn        = $("top-term");
 const setBtn       = $("set-btn");
-const strengthSlider = $("strength-slider");
-const strengthVal    = $("strength-val");
-const interpSteps    = $("interp-steps");
-const interpStepsVal = $("interp-steps-val");
-
-const canvas   = $("explore-canvas");
-const ctx      = canvas.getContext("2d");
-const tDisplay = $("t-display");
+const canvas       = $("explore-canvas");
+const ctx          = canvas.getContext("2d");
+const tDisplay     = $("t-display");
+const resultImg    = $("result-img");
+const placeholder  = $("placeholder");
+const interpStatus = $("interp-status");
 
 const W = canvas.width;   // 420
 const H = canvas.height;  // 420
 const T_RANGE = 8;
 
-// ── State ─────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────
 let modelReady   = false;
-let hasBaseImage = false;
+let hasBase      = false;
 let axesReady    = false;
-let isBusy       = false;
-let interpBusy   = false;
-let queued       = null;
+let leftTerm     = "", rightTerm  = "";
+let bottomTerm   = "", topTerm    = "";
 let statusPollId = null;
 
-let cur        = { x: W / 2, y: H / 2 };
+// Cursor: starts at centre (t=0, t=0)
+let cur = { x: W / 2, y: H / 2 };
 let isDragging = false;
-let rendered   = null;  // { x, y } of last completed render
 
-// ── Utility ───────────────────────────────────────
+// Tracks the position of the last completed render (shown as a ghost ring)
+let rendered = null;   // { x, y } in canvas coords, or null
+
+// Image throttle
+let interpBusy = false;
+let queued     = null;
+
+// ── Utilities ─────────────────────────────────────────────────────
 async function api(path, body = null) {
   const opts = body
     ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
@@ -62,44 +51,13 @@ async function api(path, body = null) {
   return res.json();
 }
 
-function showSpinner(label) {
-  spinnerLabel.textContent = label;
-  spinner.classList.add("visible");
-}
-
-function hideSpinner() {
-  spinner.classList.remove("visible");
-}
-
 function showImage(b64) {
   resultImg.src = "data:image/png;base64," + b64;
   resultImg.style.display = "block";
-  imagePlaceholder.style.display = "none";
+  placeholder.style.display = "none";
 }
 
-function setError(msg) {
-  hideSpinner();
-  isBusy = false;
-  statusBadge.textContent = "Error: " + msg;
-  statusBadge.className = "badge error";
-  setTimeout(() => {
-    statusBadge.textContent = "Ready";
-    statusBadge.className = "badge ready";
-  }, 4000);
-}
-
-function updateUI() {
-  generateBtn.disabled = isBusy || !modelReady;
-  if (hasBaseImage && !isBusy) {
-    axisRow.classList.remove("disabled");
-    setBtn.disabled = false;
-  } else {
-    axisRow.classList.add("disabled");
-    setBtn.disabled = true;
-  }
-}
-
-// ── Status polling ────────────────────────────────
+// ── Status polling ────────────────────────────────────────────────
 async function pollStatus() {
   try {
     const s = await api("/api/status");
@@ -108,61 +66,26 @@ async function pollStatus() {
       statusBadge.textContent = "Ready · " + s.device.toUpperCase();
       statusBadge.className = "badge ready";
       clearInterval(statusPollId);
-      hasBaseImage = s.has_base_image;
-      updateUI();
     } else if (s.error) {
-      statusBadge.textContent = "Load error — see terminal";
+      statusBadge.textContent = "Error — see terminal";
       statusBadge.className = "badge error";
       clearInterval(statusPollId);
     }
-  } catch (e) { /* server not up yet */ }
+    hasBase = s.has_base_image;
+    setBtn.disabled = !modelReady || !hasBase;
+
+    if (!hasBase) {
+      placeholder.querySelector("p").textContent = "Generate an image on the main page first";
+    } else if (!axesReady) {
+      placeholder.querySelector("p").textContent = "Set the four axes above to start exploring";
+    }
+  } catch (e) { /* server not ready */ }
 }
 
 statusPollId = setInterval(pollStatus, 1500);
 pollStatus();
 
-// ── Generate ──────────────────────────────────────
-genSteps.addEventListener("input", () => {
-  genStepsVal.textContent = genSteps.value;
-});
-
-generateBtn.addEventListener("click", async () => {
-  const prompt = promptInput.value.trim();
-  if (!prompt) { promptInput.focus(); return; }
-  isBusy = true;
-  updateUI();
-  showSpinner("Generating…");
-  try {
-    const seed = seedInput.value ? parseInt(seedInput.value, 10) : null;
-    const size = parseInt(genSize.value, 10);
-    const data = await api("/api/generate", {
-      prompt,
-      seed,
-      num_steps: parseInt(genSteps.value, 10),
-      width: size,
-      height: size,
-    });
-    showImage(data.image);
-    hasBaseImage = true;
-    axesReady = false;
-    rendered = null;
-    cur = { x: W / 2, y: H / 2 };
-    draw();
-    updateUI();
-  } catch (e) {
-    setError(e.message);
-  } finally {
-    hideSpinner();
-    isBusy = false;
-    updateUI();
-  }
-});
-
-promptInput.addEventListener("keydown", e => {
-  if (e.key === "Enter") generateBtn.click();
-});
-
-// ── Set axes ──────────────────────────────────────
+// ── Set axes ──────────────────────────────────────────────────────
 setBtn.addEventListener("click", async () => {
   const left   = leftIn.value.trim();
   const right  = rightIn.value.trim();
@@ -181,9 +104,10 @@ setBtn.addEventListener("click", async () => {
       left_term: left, right_term: right,
       bottom_term: bottom, top_term: top,
     });
+    leftTerm = left; rightTerm = right;
+    bottomTerm = bottom; topTerm = top;
     axesReady = true;
     rendered = null;
-    cur = { x: W / 2, y: H / 2 };
     draw();
     scheduleUpdate();
   } catch (e) {
@@ -196,20 +120,13 @@ setBtn.addEventListener("click", async () => {
   }
 });
 
-strengthSlider.addEventListener("input", () => {
-  strengthVal.textContent = (parseInt(strengthSlider.value, 10) / 100).toFixed(2);
-});
-
-interpSteps.addEventListener("input", () => {
-  interpStepsVal.textContent = interpSteps.value;
-});
-
+// Tab / Enter navigation between inputs
 leftIn.addEventListener(  "keydown", e => { if (e.key === "Enter") rightIn.focus(); });
 rightIn.addEventListener( "keydown", e => { if (e.key === "Enter") bottomIn.focus(); });
 bottomIn.addEventListener("keydown", e => { if (e.key === "Enter") topIn.focus(); });
 topIn.addEventListener(   "keydown", e => { if (e.key === "Enter") setBtn.click(); });
 
-// ── Canvas interaction ────────────────────────────
+// ── Canvas interaction ────────────────────────────────────────────
 function updateCursor(e) {
   const rect = canvas.getBoundingClientRect();
   cur.x = Math.max(0, Math.min(W, (e.clientX - rect.left) * (W / rect.width)));
@@ -227,15 +144,22 @@ canvas.addEventListener("pointermove",  e => { if (isDragging) updateCursor(e); 
 canvas.addEventListener("pointerup",    () => isDragging = false);
 canvas.addEventListener("pointercancel",() => isDragging = false);
 
-// ── Coordinate mapping ────────────────────────────
+// ── Coordinate mapping ────────────────────────────────────────────
 function curToT() {
   return {
     tx:  (cur.x / W - 0.5) * 2 * T_RANGE,
-    ty: -(cur.y / H - 0.5) * 2 * T_RANGE,
+    ty: -(cur.y / H - 0.5) * 2 * T_RANGE,  // canvas y is inverted
   };
 }
 
-// ── Drawing ───────────────────────────────────────
+function tToCanvas(tx, ty) {
+  return {
+    x: (tx / T_RANGE / 2 + 0.5) * W,
+    y: (1 - (ty / T_RANGE / 2 + 0.5)) * H,
+  };
+}
+
+// ── Drawing ───────────────────────────────────────────────────────
 function draw() {
   ctx.fillStyle = "#0f0f13";
   ctx.fillRect(0, 0, W, H);
@@ -250,18 +174,19 @@ function draw() {
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // Axis labels from current input values
+  // Axis labels at edges
   const PAD = 8;
   ctx.font = "11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
   ctx.fillStyle = "#555566";
+
   ctx.textAlign = "left";   ctx.textBaseline = "middle";
-  ctx.fillText(leftIn.value.trim(),   PAD,     H / 2);
+  ctx.fillText(leftTerm,   PAD,     H / 2);
   ctx.textAlign = "right";
-  ctx.fillText(rightIn.value.trim(),  W - PAD, H / 2);
+  ctx.fillText(rightTerm,  W - PAD, H / 2);
   ctx.textAlign = "center"; ctx.textBaseline = "top";
-  ctx.fillText(topIn.value.trim(),    W / 2,   PAD);
+  ctx.fillText(topTerm,    W / 2,   PAD);
   ctx.textBaseline = "bottom";
-  ctx.fillText(bottomIn.value.trim(), W / 2,   H - PAD);
+  ctx.fillText(bottomTerm, W / 2,   H - PAD);
   ctx.textBaseline = "alphabetic";
 
   if (!axesReady) return;
@@ -300,12 +225,14 @@ function draw() {
   ctx.arc(cur.x, cur.y, 5, 0, Math.PI * 2);
   ctx.fill();
 
+  // t readout
   tDisplay.textContent = `t₁ = ${tx.toFixed(2)}   t₂ = ${ty.toFixed(2)}`;
 }
 
+// Initial draw (empty canvas with no labels yet)
 draw();
 
-// ── Image rendering ───────────────────────────────
+// ── Image rendering ───────────────────────────────────────────────
 function scheduleUpdate() {
   if (!axesReady) return;
   queued = { ...curToT(), cx: cur.x, cy: cur.y };
@@ -319,11 +246,7 @@ async function renderImage(tx, ty, cx, cy) {
   interpBusy = true;
   interpStatus.textContent = `t₁ = ${tx.toFixed(2)}   t₂ = ${ty.toFixed(2)} …`;
   try {
-    const data = await api("/api/interpolate2d", {
-      tx, ty,
-      strength: parseInt(strengthSlider.value, 10) / 100,
-      num_steps: parseInt(interpSteps.value, 10),
-    });
+    const data = await api("/api/interpolate2d", { tx, ty, strength: 0.80, num_steps: 3 });
     showImage(data.image);
     rendered = { x: cx, y: cy };
     draw();

@@ -19,4 +19,7 @@ echo "  First run will download ~7 GB of model weights."
 echo "  Open http://localhost:8000 once 'Model ready.' appears in the log."
 echo ""
 
+# Allow MPS to use all available unified memory without a hard cap.
+export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
+
 $VENV/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --reload

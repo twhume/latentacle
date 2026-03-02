@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PicDancer Explore</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <style>
+    #explore-app {
+      display: inline-grid;
+      grid-template-rows: auto auto auto;
+      grid-template-columns: 420px 420px;
+      grid-template-areas: "header header" "axis axis" "canvas image";
+      gap: 0.5rem;
+    }
+
+    #axis-row   { grid-area: axis; }
+    #canvas-col { grid-area: canvas; display: flex; flex-direction: column; gap: 0.3rem; }
+    #image-col  { grid-area: image;  display: flex; flex-direction: column; gap: 0.3rem; }
+
+    #explore-canvas {
+      display: block;
+      cursor: crosshair;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      touch-action: none;
+    }
+
+    #image-wrap {
+      position: relative;
+      width: 420px;
+      height: 420px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    #result-img  { width: 100%; height: 100%; object-fit: cover; display: none; }
+    #placeholder {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      color: var(--muted); font-size: 0.78rem; text-align: center; padding: 1rem;
+    }
+    #interp-status {
+      font-size: 0.7rem; color: var(--muted); text-align: center;
+      min-height: 1em; font-family: "SF Mono", "Fira Code", monospace;
+    }
+    #t-display {
+      font-size: 0.7rem; color: var(--accent); text-align: center;
+      min-height: 1em; font-family: "SF Mono", "Fira Code", monospace;
+    }
+  </style>
+</head>
+<body>
+  <div id="explore-app">
+
+    <header>
+      <div style="display:flex;align-items:center;gap:0.75rem;">
+        <a href="/" class="nav-link">← Back</a>
+        <h1>PicDancer Explore</h1>
+      </div>
+      <div id="status-badge" class="badge loading">Loading…</div>
+    </header>
+
+    <section class="card" id="axis-row">
+      <div class="row">
+        <div class="axis-display"><span>X</span></div>
+        <input id="left-term"   type="text" placeholder="left…"   autocomplete="off" />
+        <input id="right-term"  type="text" placeholder="right…"  autocomplete="off" />
+        <div class="axis-display" style="margin-left:0.6rem"><span>Y</span></div>
+        <input id="bottom-term" type="text" placeholder="bottom…" autocomplete="off" />
+        <input id="top-term"    type="text" placeholder="top…"    autocomplete="off" />
+        <button id="set-btn" disabled>Set axes</button>
+      </div>
+    </section>
+
+    <section id="canvas-col">
+      <canvas id="explore-canvas" width="420" height="420"></canvas>
+      <p id="t-display"></p>
+    </section>
+
+    <section id="image-col">
+      <div id="image-wrap">
+        <img id="result-img" alt="Generated image" />
+        <div id="placeholder"><p>Generate an image on the main page first</p></div>
+      </div>
+      <p id="interp-status"></p>
+    </section>
+
+  </div>
+  <script src="/static/explore.js"></script>
+</body>
+</html>
