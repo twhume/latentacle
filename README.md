@@ -6,8 +6,6 @@ Navigate image generation in real time by dragging a cursor through SDXL-Turbo's
 
 Generate a base image from a text prompt, then define a 2D semantic space with four terms (left / right / bottom / top). Drag the cursor across the canvas and watch the image update live as you move — every position in the grid is a unique blend of the surrounding concepts.
 
-![Latentacle main interface](docs/screenshot.png)
-
 ### Pages
 
 | Page | URL | Description |
