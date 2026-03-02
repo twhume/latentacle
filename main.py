@@ -1,5 +1,5 @@
 """
-PicDancer backend — SDXL-Turbo vector interpolation server.
+Latentacle backend — SDXL-Turbo vector interpolation server.
 
 Workflow:
   1. POST /api/generate  — text-to-image, stores base image + base text embeddings
@@ -117,7 +117,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="PicDancer", lifespan=lifespan)
+app = FastAPI(title="Latentacle", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 

@@ -14,7 +14,7 @@ $PIP install --quiet --upgrade pip
 $PIP install --quiet -r requirements.txt
 
 echo ""
-echo "  PicDancer is starting."
+echo "  Latentacle is starting."
 echo "  First run will download ~7 GB of model weights."
 echo "  Open http://localhost:8000 once 'Model ready.' appears in the log."
 echo ""
