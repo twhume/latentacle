@@ -3,7 +3,6 @@
 // ── DOM refs ──────────────────────────────────────
 const $  = id => document.getElementById(id);
 
-
 const statusBadge    = $("status-badge");
 const generateBtn    = $("generate-btn");
 const promptInput    = $("prompt");
@@ -38,8 +37,9 @@ const resetBtn       = $("reset-btn");
 let modelReady    = false;
 let hasBaseImage  = false;
 let hasDirection  = false;
-let isBusy        = false;
-let pendingInterp = null;   // timer for debounced slider
+let isBusy        = false;   // locked during generate / set_terms
+let interpBusy    = false;   // in-flight interpolation request
+let queuedT       = null;    // latest slider value waiting to be rendered
 let statusPollId  = null;
 
 // ── Utility ───────────────────────────────────────
@@ -227,13 +227,23 @@ function sliderValue() {
   return parseInt(vectorSlider.value, 10) / 100;
 }
 
+// During drag: update label and fire if not already busy.
+// queuedT always holds the latest position so the final value is always rendered.
 vectorSlider.addEventListener("input", () => {
   const t = sliderValue();
   labelT.textContent = "t = " + t.toFixed(2);
+  queuedT = t;
+  if (!interpBusy) runInterpolate(t);
 });
 
-// Fire interpolation on mouseup / touchend (not on every tick)
-vectorSlider.addEventListener("change", triggerInterpolate);
+// On release: fire if nothing is running; otherwise queuedT covers it.
+vectorSlider.addEventListener("change", () => {
+  const t = sliderValue();
+  if (!interpBusy) {
+    queuedT = null;
+    runInterpolate(t);
+  }
+});
 
 // Arrow keys move the slider globally (no need to click it first).
 // Left/right = ±0.05, shift+arrow = ±0.20
@@ -247,26 +257,26 @@ document.addEventListener("keydown", e => {
 
   e.preventDefault();
   const step = e.shiftKey ? 20 : 5;
-  const next = Math.max(-200, Math.min(200,
+  const next = Math.max(-400, Math.min(400,
     parseInt(vectorSlider.value, 10) + (e.key === "ArrowLeft" ? -step : step)
   ));
   vectorSlider.value = next;
-  labelT.textContent = "t = " + (next / 100).toFixed(2);
-  triggerInterpolate();
+  const t = next / 100;
+  labelT.textContent = "t = " + t.toFixed(2);
+  if (!interpBusy) {
+    queuedT = null;
+    runInterpolate(t);
+  } else {
+    queuedT = t;
+  }
 });
 
-async function triggerInterpolate() {
-  if (!hasDirection || isBusy) return;
-  const t = sliderValue();
-
-  // t == 0: restore original without an API round-trip
-  if (t === 0) {
-    // just show base image — still needs a round-trip since we don't cache it
-    // but backend handles this cheaply
-  }
-
-  setBusy(true);
-  interpStatus.textContent = "interpolating  t = " + t.toFixed(2) + "…";
+// Runs an interpolation request. On completion, if queuedT has moved,
+// immediately fires another request for the latest position.
+async function runInterpolate(t) {
+  if (!hasDirection) return;
+  interpBusy = true;
+  interpStatus.textContent = "t = " + t.toFixed(2) + "…";
   try {
     const data = await api("/api/interpolate", {
       value: t,
@@ -275,15 +285,23 @@ async function triggerInterpolate() {
     });
     showImage(data.image);
   } catch (e) {
-    setError(e.message);
+    if (!isBusy) setError(e.message);
   } finally {
     interpStatus.textContent = "";
-    setBusy(false);
+    interpBusy = false;
+    // Drain the queue: render the latest position the user has moved to
+    if (queuedT !== null) {
+      const next = queuedT;
+      queuedT = null;
+      runInterpolate(next);
+    }
   }
 }
 
 resetBtn.addEventListener("click", () => {
   vectorSlider.value = 0;
   labelT.textContent = "t = 0.00";
-  triggerInterpolate();
+  queuedT = null;
+  if (!interpBusy) runInterpolate(0);
+  else queuedT = 0;
 });

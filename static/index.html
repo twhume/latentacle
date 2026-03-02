@@ -30,7 +30,7 @@
           <label>Seed <input id="seed" type="number" placeholder="random" /></label>
           <label><select id="gen-size">
             <option value="512">512 px</option>
-            <option value="768">768 px</option>
+            <option value="256">256 px</option>
           </select></label>
         </div>
       </section>
@@ -49,11 +49,11 @@
           <span id="label-t">t = 0.00</span>
           <span id="label-end">—</span>
         </div>
-        <input id="vector-slider" type="range" min="-200" max="200" step="1" value="0" disabled />
+        <input id="vector-slider" type="range" min="-400" max="400" step="1" value="0" disabled />
         <div class="row subtle">
           <label>Strength
-            <input id="strength-slider" type="range" min="10" max="90" step="5" value="75" />
-            <span id="strength-val">0.75</span>
+            <input id="strength-slider" type="range" min="10" max="100" step="5" value="90" />
+            <span id="strength-val">0.90</span>
           </label>
           <label>Steps
             <input id="interp-steps" type="range" min="1" max="4" step="1" value="4" />

@@ -10,6 +10,7 @@ Workflow:
 import base64
 import io
 import logging
+import math
 import random
 import threading
 from contextlib import asynccontextmanager
@@ -44,6 +45,7 @@ class State:
 
         # Set after /api/generate
         self.base_image: Optional[Image.Image] = None
+        self.base_prompt: Optional[str] = None
         self.base_embeds: Optional[torch.Tensor] = None
         self.base_pooled: Optional[torch.Tensor] = None
 
@@ -66,7 +68,7 @@ def load_model():
             log.warning("MPS not available — falling back to CPU (will be slow)")
             device = "cpu"
 
-        # float16 produces all-black images on MPS (NaN in UNet) — float32 is required
+        # float16 and bfloat16 both produce NaN on this PyTorch/MPS version.
         dtype = torch.float32
 
         log.info(f"Loading stabilityai/sdxl-turbo on {device} ({dtype}) …")
@@ -74,14 +76,10 @@ def load_model():
         state.txt2img = AutoPipelineForText2Image.from_pretrained(
             "stabilityai/sdxl-turbo",
             torch_dtype=dtype,
-            variant="fp16",  # load fp16 weights then cast to fp32 in memory
+            variant="fp16",
         ).to(device)
 
         state.img2img = AutoPipelineForImage2Image.from_pipe(state.txt2img)
-
-        # Memory optimisations
-        state.txt2img.enable_attention_slicing()
-        state.txt2img.vae.enable_slicing()
 
         state.device = device
         state.dtype = dtype
@@ -205,7 +203,8 @@ def api_generate(req: GenerateRequest):
             )
 
         img = result.images[0]
-        state.base_image = img
+        state.base_image  = img
+        state.base_prompt = req.prompt
 
         # Store prompt embeddings for later vector arithmetic
         state.base_embeds, state.base_pooled = encode_prompt(req.prompt)
@@ -213,8 +212,8 @@ def api_generate(req: GenerateRequest):
         # Reset direction when base image changes
         state.direction_embeds = None
         state.direction_pooled = None
-        state.start_term = None
-        state.end_term = None
+        state.start_term  = None
+        state.end_term    = None
 
     return {"image": img_to_b64(img)}
 
@@ -234,13 +233,19 @@ def api_set_terms(req: TermsRequest):
     require_base_image()
 
     with state.lock:
-        start_e, start_p = encode_prompt(req.start_term)
-        end_e, end_p = encode_prompt(req.end_term)
+        # Encode terms in the context of the base prompt so the direction vector
+        # captures only the modifier difference ("summer" vs "winter" applied to
+        # *this* scene) rather than the full stylistic footprint of each word in
+        # isolation.  The shared base prefix cancels algebraically in the
+        # subtraction, leaving a cleaner semantic delta.
+        ctx = state.base_prompt or ""
+        start_e, start_p = encode_prompt(f"{ctx}, {req.start_term}")
+        end_e,   end_p   = encode_prompt(f"{ctx}, {req.end_term}")
 
         state.direction_embeds = end_e - start_e
         state.direction_pooled = end_p - start_p
         state.start_term = req.start_term
-        state.end_term = req.end_term
+        state.end_term   = req.end_term
 
     return {"status": "ok"}
 
@@ -251,7 +256,7 @@ def api_set_terms(req: TermsRequest):
 
 class InterpolateRequest(BaseModel):
     value: float          # slider position, typically -2 … +2
-    strength: float = 0.65
+    strength: float = 0.90
     num_steps: int = 4
     seed: int = 42        # fixed seed for reproducible noise across slider positions
 
@@ -268,6 +273,11 @@ def api_interpolate(req: InterpolateRequest):
 
     with state.lock:
         t = req.value
+
+        # Ensure at least 1 effective denoising step.
+        # img2img uses floor(num_steps * strength) timesteps; if that's 0 the
+        # VAE receives an undenoised latent and crashes.
+        steps = max(req.num_steps, math.ceil(1.0 / req.strength))
 
         # Offset the base embeddings along the direction vector
         interp_e = (state.base_embeds + t * state.direction_embeds).to(
@@ -289,7 +299,7 @@ def api_interpolate(req: InterpolateRequest):
                 negative_prompt_embeds=torch.zeros_like(interp_e),
                 negative_pooled_prompt_embeds=torch.zeros_like(interp_p),
                 strength=req.strength,
-                num_inference_steps=req.num_steps,
+                num_inference_steps=steps,
                 guidance_scale=0.0,
                 generator=gen,
             )
