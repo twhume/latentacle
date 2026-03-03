@@ -186,8 +186,8 @@ def require_base_image():
 
 
 def require_direction():
-    if state.direction_embeds is None:
-        raise HTTPException(400, detail="Set start and end terms first")
+    if state.direction_embeds is None and state.direction2_embeds is None and state.direction3_embeds is None:
+        raise HTTPException(400, detail="Set at least one axis first")
 
 
 def _encode_image_to_latents(pipe, pil_image):
@@ -561,10 +561,10 @@ def api_set_terms3(req: TermsRequest):
 # ---------------------------------------------------------------------------
 
 class ExploreRequest(BaseModel):
-    left_term:   str
-    right_term:  str
-    bottom_term: str
-    top_term:    str
+    left_term:   str = ""
+    right_term:  str = ""
+    bottom_term: str = ""
+    top_term:    str = ""
 
 
 @app.post("/api/set_explore")
@@ -582,22 +582,35 @@ def api_set_explore(req: ExploreRequest):
                 f"{ctx}, {term} style",
             ])
 
-        l_e, l_p = enc(req.left_term)
-        r_e, r_p = enc(req.right_term)
-        b_e, b_p = enc(req.bottom_term)
-        t_e, t_p = enc(req.top_term)
+        # Axis 1 (left/right) — set or clear
+        if req.left_term and req.right_term:
+            l_e, l_p = enc(req.left_term)
+            r_e, r_p = enc(req.right_term)
+            state.direction_embeds = _scale_direction(r_e - l_e, state.base_embeds)
+            state.direction_pooled = _scale_direction(
+                _project_pooled(r_p - l_p, state.base_pooled), state.base_pooled)
+            state.start_term = req.left_term
+            state.end_term   = req.right_term
+        else:
+            state.direction_embeds = None
+            state.direction_pooled = None
+            state.start_term = None
+            state.end_term   = None
 
-        state.direction_embeds = _scale_direction(r_e - l_e, state.base_embeds)
-        state.direction_pooled = _scale_direction(
-            _project_pooled(r_p - l_p, state.base_pooled), state.base_pooled)
-        state.start_term = req.left_term
-        state.end_term   = req.right_term
-
-        state.direction2_embeds = _scale_direction(t_e - b_e, state.base_embeds)
-        state.direction2_pooled = _scale_direction(
-            _project_pooled(t_p - b_p, state.base_pooled), state.base_pooled)
-        state.start_term2 = req.bottom_term
-        state.end_term2   = req.top_term
+        # Axis 2 (bottom/top) — set or clear
+        if req.bottom_term and req.top_term:
+            b_e, b_p = enc(req.bottom_term)
+            t_e, t_p = enc(req.top_term)
+            state.direction2_embeds = _scale_direction(t_e - b_e, state.base_embeds)
+            state.direction2_pooled = _scale_direction(
+                _project_pooled(t_p - b_p, state.base_pooled), state.base_pooled)
+            state.start_term2 = req.bottom_term
+            state.end_term2   = req.top_term
+        else:
+            state.direction2_embeds = None
+            state.direction2_pooled = None
+            state.start_term2 = None
+            state.end_term2   = None
 
     return {"status": "ok"}
 
@@ -640,8 +653,12 @@ def api_interpolate2d(req: Interpolate2DRequest):
             steps = max(req.num_steps, math.ceil(1.0 / req.strength))
         strength = req.strength
 
-        interp_e = state.base_embeds + req.tx * state.direction_embeds
-        interp_p = state.base_pooled + req.tx * state.direction_pooled
+        interp_e = state.base_embeds
+        interp_p = state.base_pooled
+
+        if state.direction_embeds is not None:
+            interp_e = interp_e + req.tx * state.direction_embeds
+            interp_p = interp_p + req.tx * state.direction_pooled
 
         if state.direction2_embeds is not None:
             interp_e = interp_e + req.ty * state.direction2_embeds

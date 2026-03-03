@@ -40,6 +40,8 @@ const T_RANGE = 8;
 let modelReady   = false;
 let hasBaseImage = false;
 let axesReady    = false;
+let axisXReady   = false;  // left/right terms set
+let axisYReady   = false;  // bottom/top terms set
 let isBusy       = false;
 let interpBusy   = false;
 let queued       = null;
@@ -168,6 +170,8 @@ generateBtn.addEventListener("click", async () => {
     showImage(data.image);
     hasBaseImage = true;
     axesReady = false;
+    axisXReady = false;
+    axisYReady = false;
     rendered = null;
     cur = { x: W / 2, y: H / 2 };
     draw();
@@ -192,8 +196,16 @@ setBtn.addEventListener("click", async () => {
   const bottom = bottomIn.value.trim();
   const top    = topIn.value.trim();
 
-  if (!left || !right || !bottom || !top) {
-    [leftIn, rightIn, bottomIn, topIn].find(el => !el.value.trim())?.focus();
+  const hasX = left && right;
+  const hasY = bottom && top;
+
+  if (!hasX && !hasY) {
+    // Need at least one complete pair — focus the missing field
+    if (left && !right) { rightIn.focus(); return; }
+    if (right && !left) { leftIn.focus(); return; }
+    if (bottom && !top) { topIn.focus(); return; }
+    if (top && !bottom) { bottomIn.focus(); return; }
+    leftIn.focus();
     return;
   }
 
@@ -204,6 +216,8 @@ setBtn.addEventListener("click", async () => {
       left_term: left, right_term: right,
       bottom_term: bottom, top_term: top,
     });
+    axisXReady = hasX;
+    axisYReady = hasY;
     axesReady = true;
     rendered = null;
     cur = { x: W / 2, y: H / 2 };
@@ -228,15 +242,15 @@ interpSteps.addEventListener("input", () => {
 });
 
 leftIn.addEventListener(  "keydown", e => { if (e.key === "Enter") rightIn.focus(); });
-rightIn.addEventListener( "keydown", e => { if (e.key === "Enter") bottomIn.focus(); });
+rightIn.addEventListener( "keydown", e => { if (e.key === "Enter") { bottomIn.value.trim() ? bottomIn.focus() : setBtn.click(); } });
 bottomIn.addEventListener("keydown", e => { if (e.key === "Enter") topIn.focus(); });
 topIn.addEventListener(   "keydown", e => { if (e.key === "Enter") setBtn.click(); });
 
 // ── Canvas interaction ────────────────────────────
 function updateCursor(e) {
   const rect = canvas.getBoundingClientRect();
-  cur.x = Math.max(0, Math.min(W, (e.clientX - rect.left) * (W / rect.width)));
-  cur.y = Math.max(0, Math.min(H, (e.clientY - rect.top)  * (H / rect.height)));
+  if (axisXReady) cur.x = Math.max(0, Math.min(W, (e.clientX - rect.left) * (W / rect.width)));
+  if (axisYReady) cur.y = Math.max(0, Math.min(H, (e.clientY - rect.top)  * (H / rect.height)));
   draw();
   if (axesReady) scheduleUpdate();
 }

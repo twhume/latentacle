@@ -23,6 +23,8 @@ const T_RANGE = 8;
 let modelReady   = false;
 let hasBase      = false;
 let axesReady    = false;
+let axisXReady   = false;
+let axisYReady   = false;
 let leftTerm     = "", rightTerm  = "";
 let bottomTerm   = "", topTerm    = "";
 let statusPollId = null;
@@ -100,7 +102,7 @@ async function pollStatus() {
     if (!hasBase) {
       placeholder.querySelector("p").textContent = "Generate an image on the main page first";
     } else if (!axesReady) {
-      placeholder.querySelector("p").textContent = "Set the four axes above to start exploring";
+      placeholder.querySelector("p").textContent = "Set at least one axis pair above to start exploring";
     }
   } catch (e) { /* server not ready */ }
 }
@@ -115,8 +117,15 @@ setBtn.addEventListener("click", async () => {
   const bottom = bottomIn.value.trim();
   const top    = topIn.value.trim();
 
-  if (!left || !right || !bottom || !top) {
-    [leftIn, rightIn, bottomIn, topIn].find(el => !el.value.trim())?.focus();
+  const hasX = left && right;
+  const hasY = bottom && top;
+
+  if (!hasX && !hasY) {
+    if (left && !right) { rightIn.focus(); return; }
+    if (right && !left) { leftIn.focus(); return; }
+    if (bottom && !top) { topIn.focus(); return; }
+    if (top && !bottom) { bottomIn.focus(); return; }
+    leftIn.focus();
     return;
   }
 
@@ -127,10 +136,13 @@ setBtn.addEventListener("click", async () => {
       left_term: left, right_term: right,
       bottom_term: bottom, top_term: top,
     });
-    leftTerm = left; rightTerm = right;
-    bottomTerm = bottom; topTerm = top;
+    leftTerm = hasX ? left : ""; rightTerm = hasX ? right : "";
+    bottomTerm = hasY ? bottom : ""; topTerm = hasY ? top : "";
+    axisXReady = hasX;
+    axisYReady = hasY;
     axesReady = true;
     rendered = null;
+    cur = { x: W / 2, y: H / 2 };
     draw();
     scheduleUpdate("full");
   } catch (e) {
@@ -145,15 +157,15 @@ setBtn.addEventListener("click", async () => {
 
 // Tab / Enter navigation between inputs
 leftIn.addEventListener(  "keydown", e => { if (e.key === "Enter") rightIn.focus(); });
-rightIn.addEventListener( "keydown", e => { if (e.key === "Enter") bottomIn.focus(); });
+rightIn.addEventListener( "keydown", e => { if (e.key === "Enter") { bottomIn.value.trim() ? bottomIn.focus() : setBtn.click(); } });
 bottomIn.addEventListener("keydown", e => { if (e.key === "Enter") topIn.focus(); });
 topIn.addEventListener(   "keydown", e => { if (e.key === "Enter") setBtn.click(); });
 
 // ── Canvas interaction ────────────────────────────────────────────
 function updateCursor(e) {
   const rect = canvas.getBoundingClientRect();
-  cur.x = Math.max(0, Math.min(W, (e.clientX - rect.left) * (W / rect.width)));
-  cur.y = Math.max(0, Math.min(H, (e.clientY - rect.top)  * (H / rect.height)));
+  if (axisXReady) cur.x = Math.max(0, Math.min(W, (e.clientX - rect.left) * (W / rect.width)));
+  if (axisYReady) cur.y = Math.max(0, Math.min(H, (e.clientY - rect.top)  * (H / rect.height)));
   draw();
   if (axesReady) scheduleUpdate();
 }
