@@ -278,6 +278,7 @@ def api_status():
         "error": state.error,
         "device": state.device,
         "has_base_image": state.base_image is not None,
+        "base_prompt": state.base_prompt,
         "has_direction": state.direction_embeds is not None,
         "start_term": state.start_term,
         "end_term": state.end_term,
@@ -288,6 +289,15 @@ def api_status():
         "start_term3": state.start_term3,
         "end_term3": state.end_term3,
     }
+
+
+@app.get("/api/base_image")
+def api_base_image():
+    if state.base_image is None:
+        raise HTTPException(404, detail="No base image")
+    buf = io.BytesIO()
+    state.base_image.save(buf, format="JPEG", quality=92)
+    return Response(content=buf.getvalue(), media_type="image/jpeg")
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +369,7 @@ def api_generate(req: GenerateRequest):
 class TermsRequest(BaseModel):
     start_term: str
     end_term: str
+    confinement: float = 0.5
 
 
 def _mean_encode(phrases: list[str]):
@@ -394,28 +405,39 @@ def _renorm(interp: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
     return interp * (base.norm() / interp_norm)
 
 
-# Fraction of the pooled direction's base-parallel component to remove.
-# The pooled embedding captures global subject identity; removing part of the
-# component parallel to it reduces subject drift without killing the effect.
-# 0 = no projection, 1 = full orthogonal (too aggressive), 0.4 = gentle.
-_POOLED_PROJECTION = 0.4
-
-
-def _project_pooled(direction_p: torch.Tensor, base_p: torch.Tensor) -> torch.Tensor:
-    """Remove _POOLED_PROJECTION fraction of direction_p's component along base_p.
-
-    Only applied to pooled (1280-d) embeddings, not the 77-token sequence.
-    Sequence embeddings control fine detail and are left untouched so the
-    semantic shift still registers; pooled embeddings drive global identity,
-    so reducing their drift keeps the subject recognisable at extreme t values.
-    """
-    d = direction_p.flatten()
-    b = base_p.flatten()
+def _project_out_base(direction: torch.Tensor, base: torch.Tensor,
+                      strength: float) -> torch.Tensor:
+    """Remove `strength` fraction of direction's component parallel to base.
+    Works for any shape — flattens to 1D, projects, reshapes."""
+    d = direction.flatten()
+    b = base.flatten()
     b_norm_sq = (b * b).sum()
     if b_norm_sq < 1e-8:
-        return direction_p
+        return direction
     parallel = ((d * b).sum() / b_norm_sq) * b
-    return (d - _POOLED_PROJECTION * parallel).reshape_as(direction_p)
+    return (d - strength * parallel).reshape_as(direction)
+
+
+def _compute_direction(start_term: str, end_term: str, confinement: float):
+    """Encode start/end terms and return (dir_embeds, dir_pooled) with confinement applied."""
+    ctx = state.base_prompt or ""
+    start_e, start_p = _mean_encode([
+        f"{ctx}, {start_term}",
+        f"{ctx}, in {start_term}",
+        f"{ctx}, {start_term} style",
+    ])
+    end_e, end_p = _mean_encode([
+        f"{ctx}, {end_term}",
+        f"{ctx}, in {end_term}",
+        f"{ctx}, {end_term} style",
+    ])
+    dir_e = _scale_direction(
+        _project_out_base(end_e - start_e, state.base_embeds, confinement),
+        state.base_embeds)
+    dir_p = _scale_direction(
+        _project_out_base(end_p - start_p, state.base_pooled, confinement),
+        state.base_pooled)
+    return dir_e, dir_p
 
 
 @app.post("/api/set_terms")
@@ -424,25 +446,8 @@ def api_set_terms(req: TermsRequest):
     require_base_image()
 
     with state.lock:
-        ctx = state.base_prompt or ""
-
-        # Option A — contextual encoding: shared prefix cancels in subtraction.
-        # Option D — ensemble: average 3 phrasings to wash out phrasing-specific
-        #            style correlates while reinforcing the intended semantic delta.
-        start_e, start_p = _mean_encode([
-            f"{ctx}, {req.start_term}",
-            f"{ctx}, in {req.start_term}",
-            f"{ctx}, {req.start_term} style",
-        ])
-        end_e, end_p = _mean_encode([
-            f"{ctx}, {req.end_term}",
-            f"{ctx}, in {req.end_term}",
-            f"{ctx}, {req.end_term} style",
-        ])
-
-        state.direction_embeds = _scale_direction(end_e - start_e, state.base_embeds)
-        state.direction_pooled = _scale_direction(
-            _project_pooled(end_p - start_p, state.base_pooled), state.base_pooled)
+        state.direction_embeds, state.direction_pooled = _compute_direction(
+            req.start_term, req.end_term, req.confinement)
         state.start_term = req.start_term
         state.end_term   = req.end_term
 
@@ -514,21 +519,8 @@ def api_set_terms2(req: TermsRequest):
     require_base_image()
 
     with state.lock:
-        ctx = state.base_prompt or ""
-        start_e, start_p = _mean_encode([
-            f"{ctx}, {req.start_term}",
-            f"{ctx}, in {req.start_term}",
-            f"{ctx}, {req.start_term} style",
-        ])
-        end_e, end_p = _mean_encode([
-            f"{ctx}, {req.end_term}",
-            f"{ctx}, in {req.end_term}",
-            f"{ctx}, {req.end_term} style",
-        ])
-
-        state.direction2_embeds = _scale_direction(end_e - start_e, state.base_embeds)
-        state.direction2_pooled = _scale_direction(
-            _project_pooled(end_p - start_p, state.base_pooled), state.base_pooled)
+        state.direction2_embeds, state.direction2_pooled = _compute_direction(
+            req.start_term, req.end_term, req.confinement)
         state.start_term2 = req.start_term
         state.end_term2   = req.end_term
 
@@ -545,21 +537,8 @@ def api_set_terms3(req: TermsRequest):
     require_base_image()
 
     with state.lock:
-        ctx = state.base_prompt or ""
-        start_e, start_p = _mean_encode([
-            f"{ctx}, {req.start_term}",
-            f"{ctx}, in {req.start_term}",
-            f"{ctx}, {req.start_term} style",
-        ])
-        end_e, end_p = _mean_encode([
-            f"{ctx}, {req.end_term}",
-            f"{ctx}, in {req.end_term}",
-            f"{ctx}, {req.end_term} style",
-        ])
-
-        state.direction3_embeds = _scale_direction(end_e - start_e, state.base_embeds)
-        state.direction3_pooled = _scale_direction(
-            _project_pooled(end_p - start_p, state.base_pooled), state.base_pooled)
+        state.direction3_embeds, state.direction3_pooled = _compute_direction(
+            req.start_term, req.end_term, req.confinement)
         state.start_term3 = req.start_term
         state.end_term3   = req.end_term
 
@@ -575,6 +554,7 @@ class ExploreRequest(BaseModel):
     right_term:  str = ""
     bottom_term: str = ""
     top_term:    str = ""
+    confinement: float = 0.5
 
 
 @app.post("/api/set_explore")
@@ -583,22 +563,10 @@ def api_set_explore(req: ExploreRequest):
     require_base_image()
 
     with state.lock:
-        ctx = state.base_prompt or ""
-
-        def enc(term):
-            return _mean_encode([
-                f"{ctx}, {term}",
-                f"{ctx}, in {term}",
-                f"{ctx}, {term} style",
-            ])
-
         # Axis 1 (left/right) — set or clear
         if req.left_term and req.right_term:
-            l_e, l_p = enc(req.left_term)
-            r_e, r_p = enc(req.right_term)
-            state.direction_embeds = _scale_direction(r_e - l_e, state.base_embeds)
-            state.direction_pooled = _scale_direction(
-                _project_pooled(r_p - l_p, state.base_pooled), state.base_pooled)
+            state.direction_embeds, state.direction_pooled = _compute_direction(
+                req.left_term, req.right_term, req.confinement)
             state.start_term = req.left_term
             state.end_term   = req.right_term
         else:
@@ -609,11 +577,8 @@ def api_set_explore(req: ExploreRequest):
 
         # Axis 2 (bottom/top) — set or clear
         if req.bottom_term and req.top_term:
-            b_e, b_p = enc(req.bottom_term)
-            t_e, t_p = enc(req.top_term)
-            state.direction2_embeds = _scale_direction(t_e - b_e, state.base_embeds)
-            state.direction2_pooled = _scale_direction(
-                _project_pooled(t_p - b_p, state.base_pooled), state.base_pooled)
+            state.direction2_embeds, state.direction2_pooled = _compute_direction(
+                req.bottom_term, req.top_term, req.confinement)
             state.start_term2 = req.bottom_term
             state.end_term2   = req.top_term
         else:

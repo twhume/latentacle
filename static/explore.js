@@ -13,7 +13,9 @@ const ctx          = canvas.getContext("2d");
 const tDisplay     = $("t-display");
 const resultImg    = $("result-img");
 const placeholder  = $("placeholder");
-const interpStatus = $("interp-status");
+const interpStatus      = $("interp-status");
+const confinementSlider = $("confinement-slider");
+const confinementVal    = $("confinement-val");
 
 const W = canvas.width;   // 420
 const H = canvas.height;  // 420
@@ -135,6 +137,7 @@ setBtn.addEventListener("click", async () => {
     await api("/api/set_explore", {
       left_term: left, right_term: right,
       bottom_term: bottom, top_term: top,
+      confinement: parseInt(confinementSlider.value, 10) / 100,
     });
     leftTerm = hasX ? left : ""; rightTerm = hasX ? right : "";
     bottomTerm = hasY ? bottom : ""; topTerm = hasY ? top : "";
@@ -160,6 +163,10 @@ leftIn.addEventListener(  "keydown", e => { if (e.key === "Enter") rightIn.focus
 rightIn.addEventListener( "keydown", e => { if (e.key === "Enter") { bottomIn.value.trim() ? bottomIn.focus() : setBtn.click(); } });
 bottomIn.addEventListener("keydown", e => { if (e.key === "Enter") topIn.focus(); });
 topIn.addEventListener(   "keydown", e => { if (e.key === "Enter") setBtn.click(); });
+
+confinementSlider.addEventListener("input", () => {
+  confinementVal.textContent = (parseInt(confinementSlider.value, 10) / 100).toFixed(2);
+});
 
 // ── Canvas interaction ────────────────────────────────────────────
 function updateCursor(e) {

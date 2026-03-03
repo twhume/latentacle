@@ -29,6 +29,8 @@ const interpSteps    = $("interp-steps");
 const interpStepsVal = $("interp-steps-val");
 const scaleSlider    = $("scale-slider");
 const scaleVal       = $("scale-val");
+const confinementSlider = $("confinement-slider");
+const confinementVal    = $("confinement-val");
 
 const canvas   = $("explore-canvas");
 const ctx      = canvas.getContext("2d");
@@ -39,6 +41,12 @@ const H = canvas.height;  // 420
 let T_RANGE = parseInt(localStorage.getItem("latentacle-scale") || "8", 10);
 scaleSlider.value = T_RANGE;
 scaleVal.textContent = T_RANGE;
+
+const savedConfinement = localStorage.getItem("latentacle-confinement");
+if (savedConfinement !== null) {
+  confinementSlider.value = savedConfinement;
+  confinementVal.textContent = (parseInt(savedConfinement, 10) / 100).toFixed(2);
+}
 
 // ── State ─────────────────────────────────────────
 let modelReady   = false;
@@ -138,6 +146,31 @@ async function pollStatus() {
       statusBadge.className = "badge ready";
       clearInterval(statusPollId);
       hasBaseImage = s.has_base_image;
+
+      // Restore UI from backend state (e.g. after navigating back from pong)
+      if (hasBaseImage) {
+        if (s.base_prompt) promptInput.value = s.base_prompt;
+        // Restore axis terms
+        if (s.start_term)  leftIn.value   = s.start_term;
+        if (s.end_term)    rightIn.value  = s.end_term;
+        if (s.start_term2) bottomIn.value = s.start_term2;
+        if (s.end_term2)   topIn.value    = s.end_term2;
+        axisXReady = s.has_direction;
+        axisYReady = s.has_direction2;
+        axesReady  = axisXReady || axisYReady;
+        // Fetch and show the base image
+        try {
+          const res = await fetch("/api/base_image");
+          if (res.ok) {
+            const blob = await res.blob();
+            if (_prevBlobUrl) URL.revokeObjectURL(_prevBlobUrl);
+            _prevBlobUrl = URL.createObjectURL(blob);
+            showImageUrl(_prevBlobUrl);
+          }
+        } catch (e) { /* ignore */ }
+        draw();
+      }
+
       updateUI();
     } else if (s.error) {
       statusBadge.textContent = "Load error — see terminal";
@@ -219,6 +252,7 @@ setBtn.addEventListener("click", async () => {
     await api("/api/set_explore", {
       left_term: left, right_term: right,
       bottom_term: bottom, top_term: top,
+      confinement: parseInt(confinementSlider.value, 10) / 100,
     });
     axisXReady = hasX;
     axisYReady = hasY;
@@ -252,6 +286,11 @@ scaleSlider.addEventListener("input", () => {
   scaleVal.textContent = T_RANGE;
   localStorage.setItem("latentacle-scale", T_RANGE);
   draw();
+});
+
+confinementSlider.addEventListener("input", () => {
+  confinementVal.textContent = (parseInt(confinementSlider.value, 10) / 100).toFixed(2);
+  localStorage.setItem("latentacle-confinement", confinementSlider.value);
 });
 
 leftIn.addEventListener(  "keydown", e => { if (e.key === "Enter") rightIn.focus(); });
