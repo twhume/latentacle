@@ -77,6 +77,29 @@ function showImage(b64) {
   imagePlaceholder.style.display = "none";
 }
 
+let _prevBlobUrl = null;
+async function fetchImage(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || res.statusText);
+  }
+  const blob = await res.blob();
+  if (_prevBlobUrl) URL.revokeObjectURL(_prevBlobUrl);
+  _prevBlobUrl = URL.createObjectURL(blob);
+  return _prevBlobUrl;
+}
+
+function showImageUrl(url) {
+  resultImg.src = url;
+  resultImg.style.display = "block";
+  imagePlaceholder.style.display = "none";
+}
+
 function setError(msg) {
   hideSpinner();
   isBusy = false;
@@ -185,7 +208,7 @@ setBtn.addEventListener("click", async () => {
     rendered = null;
     cur = { x: W / 2, y: H / 2 };
     draw();
-    scheduleUpdate();
+    scheduleUpdate("full");
   } catch (e) {
     statusBadge.textContent = "Error: " + e.message;
     statusBadge.className = "badge error";
@@ -224,8 +247,14 @@ canvas.addEventListener("pointerdown", e => {
   updateCursor(e);
 });
 canvas.addEventListener("pointermove",  e => { if (isDragging) updateCursor(e); });
-canvas.addEventListener("pointerup",    () => isDragging = false);
-canvas.addEventListener("pointercancel",() => isDragging = false);
+canvas.addEventListener("pointerup",    () => {
+  isDragging = false;
+  if (axesReady) scheduleUpdate("full");
+});
+canvas.addEventListener("pointercancel",() => {
+  isDragging = false;
+  if (axesReady) scheduleUpdate("full");
+});
 
 // ── Coordinate mapping ────────────────────────────
 function curToT() {
@@ -306,25 +335,26 @@ function draw() {
 draw();
 
 // ── Image rendering ───────────────────────────────
-function scheduleUpdate() {
+function scheduleUpdate(quality = "fast") {
   if (!axesReady) return;
-  queued = { ...curToT(), cx: cur.x, cy: cur.y };
+  queued = { ...curToT(), cx: cur.x, cy: cur.y, quality };
   if (!interpBusy) {
     const p = queued; queued = null;
-    renderImage(p.tx, p.ty, p.cx, p.cy);
+    renderImage(p.tx, p.ty, p.cx, p.cy, p.quality);
   }
 }
 
-async function renderImage(tx, ty, cx, cy) {
+async function renderImage(tx, ty, cx, cy, quality) {
   interpBusy = true;
   interpStatus.textContent = `t₁ = ${tx.toFixed(2)}   t₂ = ${ty.toFixed(2)} …`;
   try {
-    const data = await api("/api/interpolate2d", {
+    const url = await fetchImage("/api/interpolate2d", {
       tx, ty,
       strength: parseInt(strengthSlider.value, 10) / 100,
       num_steps: parseInt(interpSteps.value, 10),
+      quality,
     });
-    showImage(data.image);
+    showImageUrl(url);
     rendered = { x: cx, y: cy };
     draw();
   } catch (e) {
@@ -334,7 +364,7 @@ async function renderImage(tx, ty, cx, cy) {
     interpBusy = false;
     if (queued) {
       const p = queued; queued = null;
-      renderImage(p.tx, p.ty, p.cx, p.cy);
+      renderImage(p.tx, p.ty, p.cx, p.cy, p.quality);
     }
   }
 }

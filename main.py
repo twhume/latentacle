@@ -18,8 +18,9 @@ from typing import Optional
 
 import torch
 from diffusers import AutoPipelineForImage2Image, AutoPipelineForText2Image
+from diffusers.utils.torch_utils import randn_tensor
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
@@ -48,6 +49,13 @@ class State:
         self.base_prompt: Optional[str] = None
         self.base_embeds: Optional[torch.Tensor] = None
         self.base_pooled: Optional[torch.Tensor] = None
+
+        # Cached latents for fast img2img (set in /api/generate)
+        self.base_latents_256: Optional[torch.Tensor] = None  # [1,4,32,32] fp16
+        self.base_latents_512: Optional[torch.Tensor] = None  # [1,4,64,64] fp16
+        self.base_image_256: Optional[Image.Image] = None
+        self.time_ids_256: Optional[torch.Tensor] = None
+        self.time_ids_512: Optional[torch.Tensor] = None
 
         # Set after /api/set_terms
         self.direction_embeds: Optional[torch.Tensor] = None
@@ -182,6 +190,72 @@ def require_direction():
         raise HTTPException(400, detail="Set start and end terms first")
 
 
+def _encode_image_to_latents(pipe, pil_image):
+    """Encode a PIL image to VAE latents. Returns float16 tensor on device."""
+    vae = pipe.vae
+    vae.to(dtype=torch.float32)
+    processed = pipe.image_processor.preprocess(pil_image)
+    processed = processed.to(device=state.device, dtype=torch.float32)
+    with torch.no_grad():
+        latents = vae.encode(processed).latent_dist.mode()
+    latents = latents * vae.config.scaling_factor
+    vae.to(dtype=state.dtype)
+    return latents.to(dtype=state.dtype)
+
+
+def _build_time_ids(width, height):
+    """Build SDXL micro-conditioning time_ids: [1, 6] tensor."""
+    # (original_h, original_w, crop_top, crop_left, target_h, target_w)
+    ids = torch.tensor([[height, width, 0, 0, height, width]],
+                       dtype=state.dtype, device=state.device)
+    return ids
+
+
+def _fast_img2img(cached_latents, prompt_embeds, pooled_prompt_embeds,
+                  num_steps, strength, seed, time_ids):
+    """Manual img2img loop — skips pipeline overhead, uses cached latents."""
+    pipe = state.txt2img
+    scheduler = pipe.scheduler
+    unet = pipe.unet
+    vae = pipe.vae
+
+    # Set up timesteps, slice by strength
+    scheduler.set_timesteps(num_steps, device=state.device)
+    # Number of denoising steps based on strength
+    init_timestep = min(int(num_steps * strength), num_steps)
+    t_start = max(num_steps - init_timestep, 0)
+    timesteps = scheduler.timesteps[t_start:]
+    latent_timestep = timesteps[:1]
+
+    # Add noise to cached latents
+    gen = torch.Generator(device=state.device)
+    gen.manual_seed(seed)
+    noise = randn_tensor(cached_latents.shape, generator=gen,
+                         device=state.device, dtype=state.dtype)
+    latents = scheduler.add_noise(cached_latents, noise, latent_timestep)
+
+    # UNet denoising loop (no CFG — guidance_scale=0.0)
+    added_cond_kwargs = {"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
+    for t in timesteps:
+        model_input = scheduler.scale_model_input(latents, t)
+        noise_pred = unet(model_input, t,
+                          encoder_hidden_states=prompt_embeds,
+                          added_cond_kwargs=added_cond_kwargs,
+                          return_dict=False)[0]
+        latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        if latents.dtype != state.dtype:
+            latents = latents.to(state.dtype)
+
+    # VAE decode — temporarily upcast to float32 to avoid MPS NaN
+    vae.to(dtype=torch.float32)
+    latents = latents / vae.config.scaling_factor
+    latents = latents.to(dtype=torch.float32)
+    decoded = vae.decode(latents, return_dict=False)[0]
+    vae.to(dtype=state.dtype)
+    image = pipe.image_processor.postprocess(decoded, output_type="pil")[0]
+    return image
+
+
 # ---------------------------------------------------------------------------
 # API — status
 # ---------------------------------------------------------------------------
@@ -241,6 +315,15 @@ def api_generate(req: GenerateRequest):
 
         # Store prompt embeddings for later vector arithmetic
         state.base_embeds, state.base_pooled = encode_prompt(req.prompt)
+
+        # Cache VAE-encoded latents at both resolutions
+        state.base_latents_512 = _encode_image_to_latents(state.txt2img, img)
+        state.time_ids_512 = _build_time_ids(512, 512)
+
+        img_256 = img.resize((256, 256), Image.LANCZOS)
+        state.base_image_256 = img_256
+        state.base_latents_256 = _encode_image_to_latents(state.txt2img, img_256)
+        state.time_ids_256 = _build_time_ids(256, 256)
 
         # Reset all directions when base image changes
         state.direction_embeds  = None
@@ -365,6 +448,7 @@ class InterpolateRequest(BaseModel):
     strength: float = 0.80
     num_steps: int = 3
     seed: int = 42        # fixed seed for reproducible noise across slider positions
+    quality: str = "full" # "fast" (256px, 2 steps) or "full" (512px, user steps)
 
 
 @app.post("/api/interpolate")
@@ -373,20 +457,27 @@ def api_interpolate(req: InterpolateRequest):
     require_base_image()
     require_direction()
 
+    fast = req.quality == "fast"
+
     # t == 0 → return original image unchanged
     if req.value == 0.0:
-        return {"image": img_to_b64(state.base_image)}
+        buf = io.BytesIO()
+        state.base_image.save(buf, format="JPEG", quality=85 if fast else 92)
+        return Response(content=buf.getvalue(), media_type="image/jpeg")
 
     with state.lock:
         t = req.value
 
-        # Ensure at least 1 effective denoising step.
-        # img2img uses floor(num_steps * strength) timesteps; if that's 0 the
-        # VAE receives an undenoised latent and crashes.
-        steps = max(req.num_steps, math.ceil(1.0 / req.strength))
+        # Both tiers use 512px latents for visual consistency.
+        # Fast: 2 steps (1 effective). Full: user's steps.
+        cached_latents = state.base_latents_512
+        time_ids = state.time_ids_512
+        if fast:
+            steps = 2
+        else:
+            steps = max(req.num_steps, math.ceil(1.0 / req.strength))
+        strength = req.strength
 
-        # Offset the base embeddings along the direction vector, then renorm
-        # to prevent magnitude blow-up at large t values.
         interp_e = _renorm(state.base_embeds + t * state.direction_embeds, state.base_embeds).to(
             dtype=state.dtype, device=state.device
         )
@@ -394,23 +485,13 @@ def api_interpolate(req: InterpolateRequest):
             dtype=state.dtype, device=state.device
         )
 
-        # Fixed seed keeps noise consistent as slider moves → smoother transitions
-        gen = torch.Generator(device=state.device)
-        gen.manual_seed(req.seed)
-
         with torch.inference_mode():
-            result = state.img2img(
-                image=state.base_image,
-                prompt_embeds=interp_e,
-                pooled_prompt_embeds=interp_p,
-                strength=req.strength,
-                num_inference_steps=steps,
-                guidance_scale=0.0,
-                generator=gen,
-            )
+            img = _fast_img2img(cached_latents, interp_e, interp_p,
+                                steps, strength, req.seed, time_ids)
 
-    img = result.images[0]
-    return {"image": img_to_b64(img, format="JPEG")}
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85 if fast else 92)
+    return Response(content=buf.getvalue(), media_type="image/jpeg")
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +613,7 @@ class Interpolate2DRequest(BaseModel):
     strength: float = 0.80
     num_steps: int = 3
     seed: int = 42
+    quality: str = "full" # "fast" (256px, 2 steps) or "full" (512px, user steps)
 
 
 @app.post("/api/interpolate2d")
@@ -540,11 +622,23 @@ def api_interpolate2d(req: Interpolate2DRequest):
     require_base_image()
     require_direction()
 
+    fast = req.quality == "fast"
+
     if req.tx == 0.0 and req.ty == 0.0 and req.tz == 0.0:
-        return {"image": img_to_b64(state.base_image)}
+        buf = io.BytesIO()
+        state.base_image.save(buf, format="JPEG", quality=85 if fast else 92)
+        return Response(content=buf.getvalue(), media_type="image/jpeg")
 
     with state.lock:
-        steps = max(req.num_steps, math.ceil(1.0 / req.strength))
+        # Both tiers use 512px latents for visual consistency.
+        # Fast: 2 steps (1 effective). Full: user's steps.
+        cached_latents = state.base_latents_512
+        time_ids = state.time_ids_512
+        if fast:
+            steps = 2
+        else:
+            steps = max(req.num_steps, math.ceil(1.0 / req.strength))
+        strength = req.strength
 
         interp_e = state.base_embeds + req.tx * state.direction_embeds
         interp_p = state.base_pooled + req.tx * state.direction_pooled
@@ -557,23 +651,13 @@ def api_interpolate2d(req: Interpolate2DRequest):
             interp_e = interp_e + req.tz * state.direction3_embeds
             interp_p = interp_p + req.tz * state.direction3_pooled
 
-        # Renorm after accumulating all directions — keeps magnitude on-manifold.
         interp_e = _renorm(interp_e, state.base_embeds).to(dtype=state.dtype, device=state.device)
         interp_p = _renorm(interp_p, state.base_pooled).to(dtype=state.dtype, device=state.device)
 
-        gen = torch.Generator(device=state.device)
-        gen.manual_seed(req.seed)
-
         with torch.inference_mode():
-            result = state.img2img(
-                image=state.base_image,
-                prompt_embeds=interp_e,
-                pooled_prompt_embeds=interp_p,
-                strength=req.strength,
-                num_inference_steps=steps,
-                guidance_scale=0.0,
-                generator=gen,
-            )
+            img = _fast_img2img(cached_latents, interp_e, interp_p,
+                                steps, strength, req.seed, time_ids)
 
-    img = result.images[0]
-    return {"image": img_to_b64(img, format="JPEG")}
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85 if fast else 92)
+    return Response(content=buf.getvalue(), media_type="image/jpeg")

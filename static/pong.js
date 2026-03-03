@@ -108,6 +108,29 @@ function showImage(b64) {
   placeholder.style.display = "none";
 }
 
+let _prevBlobUrl = null;
+async function fetchImage(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || res.statusText);
+  }
+  const blob = await res.blob();
+  if (_prevBlobUrl) URL.revokeObjectURL(_prevBlobUrl);
+  _prevBlobUrl = URL.createObjectURL(blob);
+  return _prevBlobUrl;
+}
+
+function showImageUrl(url) {
+  resultImg.src = url;
+  resultImg.style.display = "block";
+  placeholder.style.display = "none";
+}
+
 // ── Status polling ────────────────────────────────────────────────
 async function pollStatus() {
   try {
@@ -196,6 +219,7 @@ function resetBall() {
   ball.vy = Math.sin(ay) * BALL_SPEED;
   ball.vz = Math.sin(az) * BALL_SPEED;
   normalise3();
+  scheduleUpdate("full");
 }
 
 function normalise3() {
@@ -482,30 +506,32 @@ function draw() {
 }
 
 // ── Image rendering ───────────────────────────────────────────────
-function scheduleUpdate() {
+function scheduleUpdate(quality = "fast") {
   if (!hasDirection) return;
-  queued = ballToT();
+  const t = ballToT();
+  queued = { ...t, quality };
   if (!interpBusy) {
     const p = queued; queued = null;
-    renderImage(p.tx, p.ty, p.tz);
+    renderImage(p.tx, p.ty, p.tz, p.quality);
   }
 }
 
-async function renderImage(tx, ty, tz) {
+async function renderImage(tx, ty, tz, quality) {
   interpBusy = true;
   const parts = [`t₁=${tx.toFixed(2)}`];
   if (hasDirection2) parts.push(`t₂=${ty.toFixed(2)}`);
   if (hasDirection3) parts.push(`t₃=${tz.toFixed(2)}`);
   interpStatus.textContent = parts.join("  ") + " …";
   try {
-    const data = await api("/api/interpolate2d", {
+    const url = await fetchImage("/api/interpolate2d", {
       tx,
       ty: hasDirection2 ? ty : 0,
       tz: hasDirection3 ? tz : 0,
       strength: 0.80,
       num_steps: 3,
+      quality,
     });
-    showImage(data.image);
+    showImageUrl(url);
   } catch (e) {
     // silently swallow
   } finally {
@@ -513,7 +539,7 @@ async function renderImage(tx, ty, tz) {
     interpBusy = false;
     if (queued) {
       const p = queued; queued = null;
-      renderImage(p.tx, p.ty, p.tz);
+      renderImage(p.tx, p.ty, p.tz, p.quality);
     }
   }
 }
