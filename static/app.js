@@ -27,6 +27,8 @@ const strengthSlider = $("strength-slider");
 const strengthVal    = $("strength-val");
 const interpSteps    = $("interp-steps");
 const interpStepsVal = $("interp-steps-val");
+const scaleSlider    = $("scale-slider");
+const scaleVal       = $("scale-val");
 
 const canvas   = $("explore-canvas");
 const ctx      = canvas.getContext("2d");
@@ -34,7 +36,9 @@ const tDisplay = $("t-display");
 
 const W = canvas.width;   // 420
 const H = canvas.height;  // 420
-const T_RANGE = 8;
+let T_RANGE = parseInt(localStorage.getItem("latentacle-scale") || "8", 10);
+scaleSlider.value = T_RANGE;
+scaleVal.textContent = T_RANGE;
 
 // ── State ─────────────────────────────────────────
 let modelReady   = false;
@@ -222,7 +226,7 @@ setBtn.addEventListener("click", async () => {
     rendered = null;
     cur = { x: W / 2, y: H / 2 };
     draw();
-    scheduleUpdate("full");
+    scheduleUpdate();
   } catch (e) {
     statusBadge.textContent = "Error: " + e.message;
     statusBadge.className = "badge error";
@@ -235,10 +239,19 @@ setBtn.addEventListener("click", async () => {
 
 strengthSlider.addEventListener("input", () => {
   strengthVal.textContent = (parseInt(strengthSlider.value, 10) / 100).toFixed(2);
+  localStorage.setItem("latentacle-strength", strengthSlider.value);
 });
 
 interpSteps.addEventListener("input", () => {
   interpStepsVal.textContent = interpSteps.value;
+  localStorage.setItem("latentacle-interp-steps", interpSteps.value);
+});
+
+scaleSlider.addEventListener("input", () => {
+  T_RANGE = parseInt(scaleSlider.value, 10);
+  scaleVal.textContent = T_RANGE;
+  localStorage.setItem("latentacle-scale", T_RANGE);
+  draw();
 });
 
 leftIn.addEventListener(  "keydown", e => { if (e.key === "Enter") rightIn.focus(); });
@@ -261,14 +274,8 @@ canvas.addEventListener("pointerdown", e => {
   updateCursor(e);
 });
 canvas.addEventListener("pointermove",  e => { if (isDragging) updateCursor(e); });
-canvas.addEventListener("pointerup",    () => {
-  isDragging = false;
-  if (axesReady) scheduleUpdate("full");
-});
-canvas.addEventListener("pointercancel",() => {
-  isDragging = false;
-  if (axesReady) scheduleUpdate("full");
-});
+canvas.addEventListener("pointerup",    () => { isDragging = false; });
+canvas.addEventListener("pointercancel",() => { isDragging = false; });
 
 // ── Coordinate mapping ────────────────────────────
 function curToT() {
@@ -349,16 +356,16 @@ function draw() {
 draw();
 
 // ── Image rendering ───────────────────────────────
-function scheduleUpdate(quality = "fast") {
+function scheduleUpdate() {
   if (!axesReady) return;
-  queued = { ...curToT(), cx: cur.x, cy: cur.y, quality };
+  queued = { ...curToT(), cx: cur.x, cy: cur.y };
   if (!interpBusy) {
     const p = queued; queued = null;
-    renderImage(p.tx, p.ty, p.cx, p.cy, p.quality);
+    renderImage(p.tx, p.ty, p.cx, p.cy);
   }
 }
 
-async function renderImage(tx, ty, cx, cy, quality) {
+async function renderImage(tx, ty, cx, cy) {
   interpBusy = true;
   interpStatus.textContent = `t₁ = ${tx.toFixed(2)}   t₂ = ${ty.toFixed(2)} …`;
   try {
@@ -366,7 +373,6 @@ async function renderImage(tx, ty, cx, cy, quality) {
       tx, ty,
       strength: parseInt(strengthSlider.value, 10) / 100,
       num_steps: parseInt(interpSteps.value, 10),
-      quality,
     });
     showImageUrl(url);
     rendered = { x: cx, y: cy };
@@ -378,7 +384,7 @@ async function renderImage(tx, ty, cx, cy, quality) {
     interpBusy = false;
     if (queued) {
       const p = queued; queued = null;
-      renderImage(p.tx, p.ty, p.cx, p.cy, p.quality);
+      renderImage(p.tx, p.ty, p.cx, p.cy);
     }
   }
 }

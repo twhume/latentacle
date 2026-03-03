@@ -8,13 +8,11 @@
   <style>
     #pong-app {
       display: inline-grid;
-      grid-template-rows: auto auto auto;
+      grid-template-rows: auto auto;
       grid-template-columns: 420px 420px;
-      grid-template-areas: "header header" "axis axis" "game image";
+      grid-template-areas: "header header" "game image";
       gap: 0.5rem;
     }
-
-    #axis-row  { grid-area: axis; }
     #game-col  { grid-area: game; display: flex; flex-direction: column; gap: 0.3rem; }
     #image-col { grid-area: image; display: flex; flex-direction: column; gap: 0.3rem; }
 
@@ -84,32 +82,13 @@
       <div id="status-badge" class="badge loading">Loading…</div>
     </header>
 
-    <section class="card" id="axis-row">
-      <div class="row">
-        <div class="axis-display">
-          <span>X</span>
-          <span class="term" id="axis1-start">—</span>
-          <span class="sep">↔</span>
-          <span class="term" id="axis1-end">—</span>
-        </div>
-        <div class="row" style="flex:1; margin-left:0.8rem;">
-          <div class="axis-display"><span>Y</span></div>
-          <input id="axis2-bottom" type="text" placeholder="bottom…" autocomplete="off" />
-          <input id="axis2-top"    type="text" placeholder="top…"    autocomplete="off" />
-          <button id="set-y-btn" disabled>Set Y</button>
-        </div>
-        <div class="row" style="flex:1; margin-left:0.8rem;">
-          <div class="axis-display"><span>Z</span></div>
-          <input id="axis3-near" type="text" placeholder="near…" autocomplete="off" />
-          <input id="axis3-far"  type="text" placeholder="far…"  autocomplete="off" />
-          <button id="set-z-btn" disabled>Set Z</button>
-        </div>
-      </div>
-    </section>
-
     <section id="game-col">
       <canvas id="pong-canvas" width="420" height="360"></canvas>
-      <p id="t-display"></p>
+      <div style="display:flex;align-items:center;gap:0.6rem;">
+        <p id="t-display" style="flex:1;margin:0;"></p>
+        <button id="record-btn" disabled>Record 10s</button>
+        <span id="record-progress" style="font-size:0.7rem;color:var(--muted);font-family:'SF Mono','Fira Code',monospace;min-width:8em;"></span>
+      </div>
     </section>
 
     <section id="image-col">
@@ -125,6 +104,6 @@
     </section>
 
   </div>
-  <script src="/static/pong.js"></script>
+  <script src="/static/pong.js?v=2"></script>
 </body>
 </html>

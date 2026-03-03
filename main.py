@@ -11,15 +11,20 @@ import base64
 import io
 import logging
 import math
+import os
 import random
+import tempfile
 import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import imageio.v3 as iio
+import numpy as np
+
 import torch
 from diffusers import AutoPipelineForImage2Image, AutoPipelineForText2Image
 from diffusers.utils.torch_utils import randn_tensor
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
@@ -74,6 +79,11 @@ class State:
         self.direction3_pooled: Optional[torch.Tensor] = None
         self.start_term3: Optional[str] = None
         self.end_term3: Optional[str] = None
+
+        # Recording state
+        self.recording_frames: list = []
+        self.is_recording: bool = False
+        self.recording_fps: int = 24
 
 
 state = State()
@@ -626,7 +636,6 @@ class Interpolate2DRequest(BaseModel):
     strength: float = 0.80
     num_steps: int = 3
     seed: int = 42
-    quality: str = "full" # "fast" (256px, 2 steps) or "full" (512px, user steps)
 
 
 @app.post("/api/interpolate2d")
@@ -635,22 +644,15 @@ def api_interpolate2d(req: Interpolate2DRequest):
     require_base_image()
     require_direction()
 
-    fast = req.quality == "fast"
-
     if req.tx == 0.0 and req.ty == 0.0 and req.tz == 0.0:
         buf = io.BytesIO()
-        state.base_image.save(buf, format="JPEG", quality=85 if fast else 92)
+        state.base_image.save(buf, format="JPEG", quality=92)
         return Response(content=buf.getvalue(), media_type="image/jpeg")
 
     with state.lock:
-        # Both tiers use 512px latents for visual consistency.
-        # Fast: 2 steps (1 effective). Full: user's steps.
         cached_latents = state.base_latents_512
         time_ids = state.time_ids_512
-        if fast:
-            steps = 2
-        else:
-            steps = max(req.num_steps, math.ceil(1.0 / req.strength))
+        steps = max(req.num_steps, math.ceil(1.0 / req.strength))
         strength = req.strength
 
         interp_e = state.base_embeds
@@ -676,5 +678,63 @@ def api_interpolate2d(req: Interpolate2DRequest):
                                 steps, strength, req.seed, time_ids)
 
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85 if fast else 92)
+    img.save(buf, format="JPEG", quality=92)
     return Response(content=buf.getvalue(), media_type="image/jpeg")
+
+
+# ---------------------------------------------------------------------------
+# API — recording (pong video capture)
+# ---------------------------------------------------------------------------
+
+class StartRecordingRequest(BaseModel):
+    fps: int = 24
+
+
+@app.post("/api/start_recording")
+def api_start_recording(req: StartRecordingRequest):
+    state.recording_frames.clear()
+    state.recording_fps = req.fps
+    state.is_recording = True
+    log.info(f"Recording started at {req.fps} fps")
+    return {"status": "ok"}
+
+
+@app.post("/api/record_frame")
+async def api_record_frame(request: Request):
+    if not state.is_recording:
+        raise HTTPException(400, detail="Not recording")
+    body = await request.body()
+    img = Image.open(io.BytesIO(body))
+    state.recording_frames.append(img.copy())
+    return {"status": "ok"}
+
+
+@app.post("/api/stop_recording")
+def api_stop_recording():
+    state.is_recording = False
+    frames = state.recording_frames
+    if not frames:
+        raise HTTPException(400, detail="No frames recorded")
+
+    fps = state.recording_fps
+    log.info(f"Encoding {len(frames)} frames at {fps} fps …")
+
+    frames_np = [np.array(f) for f in frames]
+    state.recording_frames = []
+
+    # Write to a temp file — imageio ffmpeg plugin needs a seekable file
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp.close()
+    iio.imwrite(tmp.name, frames_np, fps=fps)
+
+    with open(tmp.name, "rb") as f:
+        video_bytes = f.read()
+
+    os.unlink(tmp.name)
+
+    log.info(f"Recording done — {len(video_bytes)} bytes")
+    return Response(
+        content=video_bytes,
+        media_type="video/mp4",
+        headers={"Content-Disposition": 'attachment; filename="pong_recording.mp4"'},
+    )

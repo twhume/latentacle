@@ -5,83 +5,132 @@ const $  = id => document.getElementById(id);
 const statusBadge   = $("status-badge");
 const axis1StartLbl = $("axis1-start");
 const axis1EndLbl   = $("axis1-end");
-const axis2BottomIn = $("axis2-bottom");
-const axis2TopIn    = $("axis2-top");
-const setYBtn       = $("set-y-btn");
-const axis3NearIn   = $("axis3-near");
-const axis3FarIn    = $("axis3-far");
-const setZBtn       = $("set-z-btn");
+const axis2BottomIn = $("axis2-bottom");  // may be null
+const axis2TopIn    = $("axis2-top");     // may be null
+const setYBtn       = $("set-y-btn");     // may be null
 const canvas        = $("pong-canvas");
 const ctx           = canvas.getContext("2d");
 const tDisplay      = $("t-display");
-const resultImg     = $("result-img");
-const placeholder   = $("placeholder");
-const interpStatus  = $("interp-status");
+const resultImg      = $("result-img");
+const placeholder    = $("placeholder");
+const interpStatus   = $("interp-status");
+const recordBtn      = $("record-btn");
+const recordProgress = $("record-progress");
 
 const W = canvas.width;   // 420
 const H = canvas.height;  // 360
 
-// ── 3D Court (all three axes map to real embedding directions) ────
-//   X axis → embedding direction 1 (tx)  — left paddle wall / right paddle wall
-//   Y axis → embedding direction 2 (ty)  — floor / ceiling
-//   Z axis → embedding direction 3 (tz)  — front face / back face
-const CW = 280; // X span
-const CH = 180; // Y span
-const CD = 140; // Z span
+// ── Field geometry (2D plane floating in 3D space) ────────────────
+//   U axis (direction 1): ball travels between paddles
+//   V axis (direction 2): paddles slide along their edge
+//   Axis 3: dropped — tz always 0
+const FW = 280;  // field width  (U)
+const FH = 180;  // field height (V)
 
-// Oblique projection: z axis recedes at 30° up-right
-const PROJ_AX = Math.cos(Math.PI / 6); // cos 30°
-const PROJ_AY = Math.sin(Math.PI / 6); // sin 30°
-const PROJ_ZS = 0.45;
-const OX      = 50;
-const OY      = H - 50;  // canvas y of world origin (0,0,0)
+// Camera / perspective
+const FOCAL    = 600;
+const CAM_DIST = 400;
+const CX       = W / 2;
+const CY       = H / 2;
 
-function project(x, y, z) {
-  return {
-    px: OX + x + z * PROJ_ZS * PROJ_AX,
-    py: OY - y + z * PROJ_ZS * PROJ_AY,
-  };
-}
-
-// ── Paddle geometry ───────────────────────────────────────────────
-// Both paddles sit on the X walls and move freely in the YZ plane.
-// Left paddle is Z-wide (horizontal slab) — specialises in Z-tracking.
-// Right paddle is Y-tall (vertical slab) — specialises in Y-tracking.
-const PADDLE_W   = 10;   // x-thickness (same for both)
-
-const L_PADDLE_H = 50;   // left paddle Y-span   (secondary axis)
-const L_PADDLE_D = 80;   // left paddle Z-span   (primary axis)
-
-const R_PADDLE_H = 80;   // right paddle Y-span  (primary axis)
-const R_PADDLE_D = 50;   // right paddle Z-span  (secondary axis)
-
-const PAD_X_L    = 20;         // left paddle x-centre
-const PAD_X_R    = CW - 20;    // right paddle x-centre
-const PAD_SPEED  = 130;        // px/s — kept below BALL_SPEED so misses happen
+// Paddles
+const PADDLE_LEN = 60;   // V extent
+const PADDLE_W   = 6;    // U extent (into field)
+const PAD_U_L    = 0;    // left paddle sits at U=0
+const PAD_U_R    = FW;   // right paddle sits at U=FW
+const PAD_SPEED  = 130;  // px/s
 
 const BALL_R     = 7;
 const BALL_SPEED = 160;
-const T_RANGE    = 8;   // ±T_RANGE in each embedding dimension
+const T_RANGE    = parseInt(localStorage.getItem("latentacle-scale") || "6", 10);
+
+// ── Shared settings from main page ───────────────────────────────
+function getInterpSettings() {
+  const s = parseInt(localStorage.getItem("latentacle-strength") || "80", 10);
+  const n = parseInt(localStorage.getItem("latentacle-interp-steps") || "3", 10);
+  return { strength: s / 100, num_steps: n };
+}
+
+// ── Recording state ───────────────────────────────────────────────
+let isRecording = false;
+const RECORD_FPS = 24;
+const RECORD_DURATION = 10;
+
+// ── Random rotation matrix ────────────────────────────────────────
+let rotMatrix = null;
+
+function initRotation() {
+  const DEG = Math.PI / 180;
+  const cos65 = Math.cos(65 * DEG);
+
+  for (let tries = 0; tries < 100; tries++) {
+    const pitch = (Math.random() * 2 - 1) * 54 * DEG;
+    const yaw   = (Math.random() * 2 - 1) * 54 * DEG;
+    const roll  = (Math.random() * 2 - 1) * 36 * DEG;
+
+    const ca = Math.cos(pitch), sa = Math.sin(pitch);
+    const cb = Math.cos(yaw),   sb = Math.sin(yaw);
+    const cg = Math.cos(roll),  sg = Math.sin(roll);
+
+    // R = Rz(roll) · Ry(yaw) · Rx(pitch)
+    const m = [
+      [cb * cg,  sa * sb * cg - ca * sg,  ca * sb * cg + sa * sg],
+      [cb * sg,  sa * sb * sg + ca * cg,  ca * sb * sg - sa * cg],
+      [-sb,      sa * cb,                 ca * cb               ],
+    ];
+
+    // Plane normal (originally [0,0,1]) must face camera
+    if (m[2][2] > cos65) {
+      rotMatrix = m;
+      return;
+    }
+  }
+
+  // Fallback: identity (virtually unreachable)
+  rotMatrix = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+}
+
+initRotation();
+
+// ── Perspective projection ────────────────────────────────────────
+const VIEW_SCALE = 0.78;
+
+function project(u, v) {
+  // Center field at origin
+  const lu = u - FW / 2;
+  const lv = v - FH / 2;
+
+  // Rotate (point lies on z=0 plane, so only first two columns matter)
+  const rx = rotMatrix[0][0] * lu + rotMatrix[0][1] * lv;
+  const ry = rotMatrix[1][0] * lu + rotMatrix[1][1] * lv;
+  const rz = rotMatrix[2][0] * lu + rotMatrix[2][1] * lv;
+
+  const Z = rz + CAM_DIST;
+
+  return {
+    px: VIEW_SCALE * FOCAL * rx / Z + CX,
+    py: VIEW_SCALE * FOCAL * (-ry) / Z + CY,
+    depth: Z,
+  };
+}
 
 // ── App state ─────────────────────────────────────────────────────
 let modelReady    = false;
 let hasDirection  = false;
 let hasDirection2 = false;
-let hasDirection3 = false;
 let axis1Start = "—", axis1End = "—";
 let axis2Bottom = "",  axis2Top  = "";
-let axis3Near   = "",  axis3Far  = "";
 let statusPollId = null;
 let gameStarted  = false;
 
 // ── Game state ────────────────────────────────────────────────────
-let ball     = { x: CW/2, y: CH/2, z: CD/2, vx: 0, vy: 0, vz: 0 };
-let leftPad  = { y: CH/2, z: CD/2 };  // moves in Y (secondary) and Z (primary)
-let rightPad = { y: CH/2, z: CD/2 };  // moves in Y (primary)  and Z (secondary)
+let ball     = { u: FW / 2, v: FH / 2, vu: 0, vv: 0 };
+let leftPad  = { v: FH / 2 };
+let rightPad = { v: FH / 2 };
 
-// Four independent noise streams — each paddle has one per tracked dimension
-let lNoiseY = 0, lNoiseZ = 0;  // left paddle
-let rNoiseY = 0, rNoiseZ = 0;  // right paddle
+// Two noise streams (one per paddle)
+let lNoiseV = 0;
+let rNoiseV = 0;
 
 let lastTs = null;
 
@@ -148,25 +197,24 @@ async function pollStatus() {
 
     hasDirection  = s.has_direction;
     hasDirection2 = s.has_direction2 || false;
-    hasDirection3 = s.has_direction3 || false;
 
-    if (s.start_term)  { axis1StartLbl.textContent = axis1Start = s.start_term; }
-    if (s.end_term)    { axis1EndLbl.textContent   = axis1End   = s.end_term;   }
+    if (s.start_term)  { if (axis1StartLbl) axis1StartLbl.textContent = s.start_term; axis1Start = s.start_term; }
+    if (s.end_term)    { if (axis1EndLbl) axis1EndLbl.textContent = s.end_term;   axis1End   = s.end_term;   }
     if (s.start_term2) axis2Bottom = s.start_term2;
     if (s.end_term2)   axis2Top    = s.end_term2;
-    if (s.start_term3) axis3Near   = s.start_term3;
-    if (s.end_term3)   axis3Far    = s.end_term3;
 
     const ready = modelReady && s.has_base_image;
-    setYBtn.disabled = !ready;
-    setZBtn.disabled = !ready;
+    if (setYBtn) setYBtn.disabled = !ready;
 
     if (!s.has_base_image) {
       placeholder.querySelector("p").textContent = "Generate an image on the main page first";
     } else if (!s.has_direction) {
       placeholder.querySelector("p").textContent = "Set start/end terms on the main page first";
+    } else {
+      placeholder.style.display = "none";
     }
 
+    if (recordBtn) recordBtn.disabled = !(ready && hasDirection);
     if (hasDirection && !gameStarted) startGame();
   } catch (e) { /* server not ready */ }
 }
@@ -195,44 +243,35 @@ function makeAxisSetter(btn, labelEl, inA, inB, endpoint, onDone) {
   });
 }
 
-makeAxisSetter(setYBtn, "Set Y", axis2BottomIn, axis2TopIn, "/api/set_terms2", (a, b) => {
-  hasDirection2 = true; axis2Bottom = a; axis2Top = b;
-});
-makeAxisSetter(setZBtn, "Set Z", axis3NearIn, axis3FarIn, "/api/set_terms3", (a, b) => {
-  hasDirection3 = true; axis3Near = a; axis3Far = b;
-});
-
-axis2BottomIn.addEventListener("keydown", e => { if (e.key === "Enter") axis2TopIn.focus(); });
-axis2TopIn.addEventListener("keydown",    e => { if (e.key === "Enter") setYBtn.click(); });
-axis3NearIn.addEventListener("keydown",   e => { if (e.key === "Enter") axis3FarIn.focus(); });
-axis3FarIn.addEventListener("keydown",    e => { if (e.key === "Enter") setZBtn.click(); });
+if (setYBtn) {
+  makeAxisSetter(setYBtn, "Set Y", axis2BottomIn, axis2TopIn, "/api/set_terms2", (a, b) => {
+    hasDirection2 = true; axis2Bottom = a; axis2Top = b;
+  });
+  axis2BottomIn.addEventListener("keydown", e => { if (e.key === "Enter") axis2TopIn.focus(); });
+  axis2TopIn.addEventListener("keydown",    e => { if (e.key === "Enter") setYBtn.click(); });
+}
 
 // ── Ball ──────────────────────────────────────────────────────────
 function resetBall() {
-  ball.x = CW / 2;
-  ball.y = CH / 2 + (Math.random() - 0.5) * CH * 0.3;
-  ball.z = CD / 2 + (Math.random() - 0.5) * CD * 0.3;
-  const ay = (Math.random() - 0.5) * 0.7;
-  const az = (Math.random() - 0.5) * 0.7;
+  ball.u = FW / 2;
+  ball.v = FH / 2 + (Math.random() - 0.5) * FH * 0.3;
+  const angle = (Math.random() - 0.5) * 0.7;
   const dir = Math.random() > 0.5 ? 1 : -1;
-  ball.vx = Math.cos(ay) * Math.cos(az) * BALL_SPEED * dir;
-  ball.vy = Math.sin(ay) * BALL_SPEED;
-  ball.vz = Math.sin(az) * BALL_SPEED;
-  normalise3();
-  scheduleUpdate("full");
+  ball.vu = Math.cos(angle) * BALL_SPEED * dir;
+  ball.vv = Math.sin(angle) * BALL_SPEED;
+  normalise2();
+  scheduleUpdate();
 }
 
-function normalise3() {
-  const spd = Math.hypot(ball.vx, ball.vy, ball.vz);
+function normalise2() {
+  const spd = Math.hypot(ball.vu, ball.vv);
   if (spd > 0) {
-    ball.vx = ball.vx / spd * BALL_SPEED;
-    ball.vy = ball.vy / spd * BALL_SPEED;
-    ball.vz = ball.vz / spd * BALL_SPEED;
+    ball.vu = ball.vu / spd * BALL_SPEED;
+    ball.vv = ball.vv / spd * BALL_SPEED;
   }
 }
 
 // ── Paddle AI ─────────────────────────────────────────────────────
-// Each noise stream is a damped random walk — gives smooth, continuous imperfection
 function stepNoise(n, dt) {
   const impulse = (Math.random() - 0.5) * 260 * dt;
   return Math.max(-45, Math.min(45, n * Math.pow(0.80, dt * 20) + impulse));
@@ -249,71 +288,61 @@ function movePad(current, target, min, max, speed, dt) {
 function startGame() {
   if (gameStarted) return;
   gameStarted = true;
+  if (recordBtn) recordBtn.disabled = false;
   resetBall();
   requestAnimationFrame(gameStep);
 }
 
-function gameStep(ts) {
-  if (!lastTs) lastTs = ts;
-  const dt = Math.min((ts - lastTs) / 1000, 0.05);
-  lastTs = ts;
+function stepPhysics(dt) {
+  ball.u += ball.vu * dt;
+  ball.v += ball.vv * dt;
 
-  ball.x += ball.vx * dt;
-  ball.y += ball.vy * dt;
-  ball.z += ball.vz * dt;
+  // V walls (top / bottom of field)
+  if (ball.v - BALL_R <= 0)  { ball.v = BALL_R;      ball.vv =  Math.abs(ball.vv); }
+  if (ball.v + BALL_R >= FH) { ball.v = FH - BALL_R; ball.vv = -Math.abs(ball.vv); }
 
-  // Y walls (floor / ceiling)
-  if (ball.y - BALL_R <= 0)  { ball.y = BALL_R;      ball.vy =  Math.abs(ball.vy); }
-  if (ball.y + BALL_R >= CH) { ball.y = CH - BALL_R; ball.vy = -Math.abs(ball.vy); }
-
-  // Z walls (front face / back face)
-  if (ball.z - BALL_R <= 0)  { ball.z = BALL_R;      ball.vz =  Math.abs(ball.vz); }
-  if (ball.z + BALL_R >= CD) { ball.z = CD - BALL_R; ball.vz = -Math.abs(ball.vz); }
-
-  // ── Left paddle (Z-primary, Y-secondary) ─────────────────────
-  if (ball.vx < 0 && ball.x - BALL_R <= PAD_X_L + PADDLE_W / 2) {
-    const yHit = Math.abs(ball.y - leftPad.y) <= L_PADDLE_H / 2 + BALL_R;
-    const zHit = Math.abs(ball.z - leftPad.z) <= L_PADDLE_D / 2 + BALL_R;
-    if (yHit && zHit) {
-      ball.x  = PAD_X_L + PADDLE_W / 2 + BALL_R;
-      ball.vx = Math.abs(ball.vx);
-      ball.vy += (ball.y - leftPad.y) / (L_PADDLE_H / 2) * 50;
-      ball.vz += (ball.z - leftPad.z) / (L_PADDLE_D / 2) * 50;
-      normalise3();
+  // Left paddle collision at U ≈ 0
+  if (ball.vu < 0 && ball.u - BALL_R <= PAD_U_L + PADDLE_W) {
+    const vHit = Math.abs(ball.v - leftPad.v) <= PADDLE_LEN / 2 + BALL_R;
+    if (vHit) {
+      ball.u  = PAD_U_L + PADDLE_W + BALL_R;
+      ball.vu = Math.abs(ball.vu);
+      ball.vv += (ball.v - leftPad.v) / (PADDLE_LEN / 2) * 50;
+      normalise2();
     } else {
       resetBall();
     }
   }
 
-  // ── Right paddle (Y-primary, Z-secondary) ────────────────────
-  if (ball.vx > 0 && ball.x + BALL_R >= PAD_X_R - PADDLE_W / 2) {
-    const yHit = Math.abs(ball.y - rightPad.y) <= R_PADDLE_H / 2 + BALL_R;
-    const zHit = Math.abs(ball.z - rightPad.z) <= R_PADDLE_D / 2 + BALL_R;
-    if (yHit && zHit) {
-      ball.x  = PAD_X_R - PADDLE_W / 2 - BALL_R;
-      ball.vx = -Math.abs(ball.vx);
-      ball.vy += (ball.y - rightPad.y) / (R_PADDLE_H / 2) * 50;
-      ball.vz += (ball.z - rightPad.z) / (R_PADDLE_D / 2) * 50;
-      normalise3();
+  // Right paddle collision at U ≈ FW
+  if (ball.vu > 0 && ball.u + BALL_R >= PAD_U_R - PADDLE_W) {
+    const vHit = Math.abs(ball.v - rightPad.v) <= PADDLE_LEN / 2 + BALL_R;
+    if (vHit) {
+      ball.u  = PAD_U_R - PADDLE_W - BALL_R;
+      ball.vu = -Math.abs(ball.vu);
+      ball.vv += (ball.v - rightPad.v) / (PADDLE_LEN / 2) * 50;
+      normalise2();
     } else {
       resetBall();
     }
   }
 
   // Advance noise streams
-  lNoiseY = stepNoise(lNoiseY, dt);
-  lNoiseZ = stepNoise(lNoiseZ, dt);
-  rNoiseY = stepNoise(rNoiseY, dt);
-  rNoiseZ = stepNoise(rNoiseZ, dt);
+  lNoiseV = stepNoise(lNoiseV, dt);
+  rNoiseV = stepNoise(rNoiseV, dt);
 
-  // Left paddle: Z is primary (good), Y is secondary (slower, noisier)
-  leftPad.z = movePad(leftPad.z, ball.z + lNoiseZ, L_PADDLE_D/2, CD - L_PADDLE_D/2, PAD_SPEED,        dt);
-  leftPad.y = movePad(leftPad.y, ball.y + lNoiseY, L_PADDLE_H/2, CH - L_PADDLE_H/2, PAD_SPEED * 0.5, dt);
+  // 1D paddle AI — track ball.v with noise
+  leftPad.v  = movePad(leftPad.v,  ball.v + lNoiseV, PADDLE_LEN / 2, FH - PADDLE_LEN / 2, PAD_SPEED, dt);
+  rightPad.v = movePad(rightPad.v, ball.v + rNoiseV, PADDLE_LEN / 2, FH - PADDLE_LEN / 2, PAD_SPEED, dt);
+}
 
-  // Right paddle: Y is primary (good), Z is secondary (slower, noisier)
-  rightPad.y = movePad(rightPad.y, ball.y + rNoiseY, R_PADDLE_H/2, CH - R_PADDLE_H/2, PAD_SPEED,        dt);
-  rightPad.z = movePad(rightPad.z, ball.z + rNoiseZ, R_PADDLE_D/2, CD - R_PADDLE_D/2, PAD_SPEED * 0.5, dt);
+function gameStep(ts) {
+  if (isRecording) { requestAnimationFrame(gameStep); return; }
+  if (!lastTs) lastTs = ts;
+  const dt = Math.min((ts - lastTs) / 1000, 0.05);
+  lastTs = ts;
 
+  stepPhysics(dt);
   draw();
   scheduleUpdate();
   requestAnimationFrame(gameStep);
@@ -321,10 +350,9 @@ function gameStep(ts) {
 
 // ── Coordinate mapping ────────────────────────────────────────────
 function ballToT() {
-  const tx = (ball.x / CW - 0.5) * 2 * T_RANGE;
-  const ty = (ball.y / CH - 0.5) * 2 * T_RANGE;
-  const tz = (ball.z / CD - 0.5) * 2 * T_RANGE;
-  return { tx, ty, tz };
+  const tx = (ball.u / FW - 0.5) * 2 * T_RANGE;
+  const ty = (ball.v / FH - 0.5) * 2 * T_RANGE;
+  return { tx, ty, tz: 0 };
 }
 
 // ── Drawing helpers ───────────────────────────────────────────────
@@ -337,8 +365,8 @@ function fillFace(pts, style) {
   ctx.fill();
 }
 
-function strokeEdge(x1, y1, z1, x2, y2, z2, style, width, dash) {
-  const a = project(x1, y1, z1), b = project(x2, y2, z2);
+function strokeEdge(u1, v1, u2, v2, style, width, dash) {
+  const a = project(u1, v1), b = project(u2, v2);
   ctx.strokeStyle = style;
   ctx.lineWidth   = width;
   ctx.setLineDash(dash || []);
@@ -359,72 +387,70 @@ function scaleHex(hex, f) {
 
 // ── Court ─────────────────────────────────────────────────────────
 function drawCourt() {
-  fillFace([
-    project(0, 0, 0), project(CW, 0, 0), project(CW, 0, CD), project(0, 0, CD),
-  ], "rgba(26,26,40,0.85)");
+  const c0 = project(0, 0);
+  const c1 = project(FW, 0);
+  const c2 = project(FW, FH);
+  const c3 = project(0, FH);
 
-  fillFace([
-    project(0, 0, CD), project(CW, 0, CD), project(CW, CH, CD), project(0, CH, CD),
-  ], "rgba(18,18,30,0.55)");
+  // Filled field
+  fillFace([c0, c1, c2, c3], "rgba(22,22,36,0.85)");
 
-  fillFace([
-    project(0, CH, 0), project(CW, CH, 0), project(CW, CH, CD), project(0, CH, CD),
-  ], "rgba(16,16,26,0.25)");
+  // Border
+  ctx.strokeStyle = "#3a3a55";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(c0.px, c0.py);
+  ctx.lineTo(c1.px, c1.py);
+  ctx.lineTo(c2.px, c2.py);
+  ctx.lineTo(c3.px, c3.py);
+  ctx.closePath();
+  ctx.stroke();
 
-  const dashed = [
-    [0,0,0, 0,0,CD], [CW,0,0, CW,0,CD], [CW,CH,0, CW,CH,CD], [0,CH,0, 0,CH,CD],
-    [0,0,CD, CW,0,CD], [0,CH,CD, CW,CH,CD], [0,0,CD, 0,CH,CD], [CW,0,CD, CW,CH,CD],
-  ];
-  for (const [x1,y1,z1,x2,y2,z2] of dashed)
-    strokeEdge(x1,y1,z1, x2,y2,z2, "#2a2a40", 1, [3, 5]);
-
-  const front = [
-    [0,0,0, CW,0,0], [CW,0,0, CW,CH,0], [CW,CH,0, 0,CH,0], [0,CH,0, 0,0,0],
-  ];
-  for (const [x1,y1,z1,x2,y2,z2] of front)
-    strokeEdge(x1,y1,z1, x2,y2,z2, "#3a3a55", 1.5, null);
-
-  strokeEdge(CW/2, 0, 0, CW/2, 0, CD, "#252538", 1, [4, 4]);
+  // Dashed center line
+  strokeEdge(FW / 2, 0, FW / 2, FH, "#252538", 1, [4, 4]);
 }
 
 // ── Paddles ───────────────────────────────────────────────────────
-function drawPaddle(cx, cy, cz, ph, pd, color) {
-  const x0 = cx - PADDLE_W / 2, x1 = cx + PADDLE_W / 2;
-  const y0 = cy - ph / 2,       y1 = cy + ph / 2;
-  const z0 = cz - pd / 2,       z1 = cz + pd / 2;
+function drawPaddle(padU, padV, color) {
+  const halfLen = PADDLE_LEN / 2;
+  const isLeft = padU < FW / 2;
+  const u0 = isLeft ? padU : padU - PADDLE_W;
+  const u1 = isLeft ? padU + PADDLE_W : padU;
+  const v0 = padV - halfLen;
+  const v1 = padV + halfLen;
 
-  fillFace([
-    project(x0, y1, z0), project(x1, y1, z0),
-    project(x1, y1, z1), project(x0, y1, z1),
-  ], scaleHex(color, 1.30));
+  // Main face
+  fillFace([project(u0, v0), project(u1, v0), project(u1, v1), project(u0, v1)], color);
 
-  const innerX = cx < CW / 2 ? x1 : x0;
-  fillFace([
-    project(innerX, y0, z0), project(innerX, y1, z0),
-    project(innerX, y1, z1), project(innerX, y0, z1),
-  ], scaleHex(color, 0.70));
-
-  fillFace([
-    project(x0, y0, z0), project(x1, y0, z0),
-    project(x1, y1, z0), project(x0, y1, z0),
-  ], color);
+  // Bright inner edge (facing field centre)
+  const innerU = isLeft ? u1 : u0;
+  const eA = project(innerU, v0);
+  const eB = project(innerU, v1);
+  ctx.strokeStyle = scaleHex(color, 1.5);
+  ctx.lineWidth = 2;
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(eA.px, eA.py);
+  ctx.lineTo(eB.px, eB.py);
+  ctx.stroke();
 }
 
 // ── Ball ──────────────────────────────────────────────────────────
 function drawBallShadow() {
-  const sp = project(ball.x, 0, ball.z);
-  const r  = BALL_R;
-  const alpha = 0.12 + (ball.y / CH) * 0.28;
+  const sp = project(ball.u, ball.v);
+  const r  = BALL_R * (FOCAL / sp.depth) * 0.7;
   ctx.beginPath();
-  ctx.ellipse(sp.px, sp.py, r * 2.6, r * 0.85, 0, 0, Math.PI * 2);
-  ctx.fillStyle = `rgba(0,0,0,${alpha.toFixed(2)})`;
+  ctx.arc(sp.px + 3, sp.py + 3, r, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(0,0,0,0.18)";
   ctx.fill();
 }
 
 function drawBall() {
   const { tx } = ballToT();
-  const p = project(ball.x, ball.y, ball.z);
-  const r   = BALL_R * (1 - (ball.z / CD) * 0.12);
+  const p = project(ball.u, ball.v);
+  const scale = FOCAL / p.depth;
+  const r   = BALL_R * scale;
   const hue = 260 + tx * 9;
 
   const grd = ctx.createRadialGradient(
@@ -442,37 +468,36 @@ function drawBall() {
 
 // ── Axis labels ───────────────────────────────────────────────────
 function drawAxisLabels() {
+  const LABEL_PAD = 8;
   ctx.font = "11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
   ctx.fillStyle = "#555566";
 
-  // Axis 1 (X / tx) — between paddles, mid-height, mid-depth
-  const lp = project(PAD_X_L + PADDLE_W / 2 + 5, CH / 2, CD / 2);
-  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  // Axis 1 (U / tx) — just outside left and right field edges
+  const lp = project(-12, FH / 2);
+  lp.px = Math.max(LABEL_PAD, Math.min(W - LABEL_PAD, lp.px));
+  lp.py = Math.max(LABEL_PAD, Math.min(H - LABEL_PAD, lp.py));
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
   ctx.fillText(axis1Start, lp.px, lp.py);
 
-  const rp = project(PAD_X_R - PADDLE_W / 2 - 5, CH / 2, CD / 2);
-  ctx.textAlign = "right";
+  const rp = project(FW + 12, FH / 2);
+  rp.px = Math.max(LABEL_PAD, Math.min(W - LABEL_PAD, rp.px));
+  rp.py = Math.max(LABEL_PAD, Math.min(H - LABEL_PAD, rp.py));
+  ctx.textAlign = "left";
   ctx.fillText(axis1End, rp.px, rp.py);
 
-  // Axis 2 (Y / ty) — above and below the front face
+  // Axis 2 (V / ty) — just outside top and bottom field edges
   if (axis2Top || axis2Bottom) {
     ctx.textAlign = "center";
-    const tp = project(CW / 2, CH + 8, 0);
+    const tp = project(FW / 2, FH + 14);
+    tp.px = Math.max(LABEL_PAD, Math.min(W - LABEL_PAD, tp.px));
+    tp.py = Math.max(LABEL_PAD, Math.min(H - LABEL_PAD, tp.py));
     ctx.textBaseline = "bottom";
     ctx.fillText(axis2Top, tp.px, tp.py);
-    const bp = project(CW / 2, -8, 0);
+    const bp = project(FW / 2, -14);
+    bp.px = Math.max(LABEL_PAD, Math.min(W - LABEL_PAD, bp.px));
+    bp.py = Math.max(LABEL_PAD, Math.min(H - LABEL_PAD, bp.py));
     ctx.textBaseline = "top";
     ctx.fillText(axis2Bottom, bp.px, bp.py);
-  }
-
-  // Axis 3 (Z / tz) — along the left wall, at mid-height, front→back
-  if (axis3Near || axis3Far) {
-    ctx.textAlign = "right";
-    ctx.textBaseline = "middle";
-    const np = project(-6, CH / 2, 0);
-    ctx.fillText(axis3Near, np.px, np.py);
-    const fp = project(-6, CH / 2, CD);
-    ctx.fillText(axis3Far, fp.px, fp.py);
   }
 
   ctx.textBaseline = "alphabetic";
@@ -486,50 +511,51 @@ function draw() {
   drawCourt();
   drawBallShadow();
 
-  // Depth-sort paddles (draw the further-back one first)
-  if (leftPad.z >= rightPad.z) {
-    drawPaddle(PAD_X_L, leftPad.y,  leftPad.z,  L_PADDLE_H, L_PADDLE_D, "#7c6af7");
-    drawPaddle(PAD_X_R, rightPad.y, rightPad.z, R_PADDLE_H, R_PADDLE_D, "#b86cf7");
+  // Depth-sort paddles (draw the farther one first)
+  const lDepth = project(PAD_U_L, leftPad.v).depth;
+  const rDepth = project(PAD_U_R, rightPad.v).depth;
+
+  if (lDepth >= rDepth) {
+    drawPaddle(PAD_U_L, leftPad.v,  "#7c6af7");
+    drawPaddle(PAD_U_R, rightPad.v, "#b86cf7");
   } else {
-    drawPaddle(PAD_X_R, rightPad.y, rightPad.z, R_PADDLE_H, R_PADDLE_D, "#b86cf7");
-    drawPaddle(PAD_X_L, leftPad.y,  leftPad.z,  L_PADDLE_H, L_PADDLE_D, "#7c6af7");
+    drawPaddle(PAD_U_R, rightPad.v, "#b86cf7");
+    drawPaddle(PAD_U_L, leftPad.v,  "#7c6af7");
   }
 
   drawBall();
   drawAxisLabels();
 
-  const { tx, ty, tz } = ballToT();
+  const { tx, ty } = ballToT();
   const parts = [`t₁=${tx.toFixed(2)}`];
   if (hasDirection2) parts.push(`t₂=${ty.toFixed(2)}`);
-  if (hasDirection3) parts.push(`t₃=${tz.toFixed(2)}`);
   tDisplay.textContent = parts.join("  ");
 }
 
 // ── Image rendering ───────────────────────────────────────────────
-function scheduleUpdate(quality = "fast") {
-  if (!hasDirection) return;
+function scheduleUpdate() {
+  if (!hasDirection || isRecording) return;
   const t = ballToT();
-  queued = { ...t, quality };
+  queued = { ...t };
   if (!interpBusy) {
     const p = queued; queued = null;
-    renderImage(p.tx, p.ty, p.tz, p.quality);
+    renderImage(p.tx, p.ty, p.tz);
   }
 }
 
-async function renderImage(tx, ty, tz, quality) {
+async function renderImage(tx, ty, tz) {
   interpBusy = true;
   const parts = [`t₁=${tx.toFixed(2)}`];
   if (hasDirection2) parts.push(`t₂=${ty.toFixed(2)}`);
-  if (hasDirection3) parts.push(`t₃=${tz.toFixed(2)}`);
   interpStatus.textContent = parts.join("  ") + " …";
   try {
+    const { strength, num_steps } = getInterpSettings();
     const url = await fetchImage("/api/interpolate2d", {
       tx,
       ty: hasDirection2 ? ty : 0,
-      tz: hasDirection3 ? tz : 0,
-      strength: 0.80,
-      num_steps: 3,
-      quality,
+      tz: 0,
+      strength,
+      num_steps,
     });
     showImageUrl(url);
   } catch (e) {
@@ -539,7 +565,120 @@ async function renderImage(tx, ty, tz, quality) {
     interpBusy = false;
     if (queued) {
       const p = queued; queued = null;
-      renderImage(p.tx, p.ty, p.tz, p.quality);
+      renderImage(p.tx, p.ty, p.tz);
     }
   }
+}
+
+// ── Composite recording canvas ────────────────────────────────────
+let compCanvas = null;
+let compCtx    = null;
+
+function ensureCompCanvas() {
+  if (!compCanvas) {
+    compCanvas = document.createElement("canvas");
+    compCanvas.width  = 840;
+    compCanvas.height = 420;
+    compCtx = compCanvas.getContext("2d");
+  }
+}
+
+function sendCompositeFrame() {
+  ensureCompCanvas();
+  compCtx.fillStyle = "#0f0f13";
+  compCtx.fillRect(0, 0, 840, 420);
+  // Pong canvas (420×360) centred vertically in 420px
+  compCtx.drawImage(canvas, 0, 30);
+  // AI image (420×420) on the right
+  compCtx.drawImage(resultImg, 420, 0, 420, 420);
+  return new Promise((resolve, reject) => {
+    compCanvas.toBlob(blob => {
+      if (!blob) { resolve(); return; }
+      fetch("/api/record_frame", {
+        method: "POST",
+        headers: { "Content-Type": "image/jpeg" },
+        body: blob,
+      }).then(resolve).catch(reject);
+    }, "image/jpeg", 0.92);
+  });
+}
+
+// ── Recording ─────────────────────────────────────────────────────
+async function recordingLoop() {
+  const dt = 1 / RECORD_FPS;
+  const totalFrames = RECORD_DURATION * RECORD_FPS;
+
+  for (let frame = 0; frame < totalFrames; frame++) {
+    stepPhysics(dt);
+    draw();
+
+    const { tx, ty } = ballToT();
+    const { strength, num_steps } = getInterpSettings();
+    const url = await fetchImage("/api/interpolate2d", {
+      tx,
+      ty: hasDirection2 ? ty : 0,
+      tz: 0,
+      strength,
+      num_steps,
+    });
+    showImageUrl(url);
+
+    // Wait for AI image to load, then send composite frame
+    await new Promise(resolve => {
+      if (resultImg.complete) { resolve(); return; }
+      resultImg.onload = resolve;
+      resultImg.onerror = resolve;
+    });
+    await sendCompositeFrame();
+
+    recordProgress.textContent = `${((frame + 1) / RECORD_FPS).toFixed(1)}s / ${RECORD_DURATION}s`;
+  }
+}
+
+if (recordBtn) {
+  recordBtn.addEventListener("click", async () => {
+    if (isRecording) return;
+    isRecording = true;
+    recordBtn.disabled = true;
+    recordBtn.textContent = "Recording…";
+    recordProgress.textContent = "0.0s / " + RECORD_DURATION + "s";
+
+    try {
+      // Tell backend to start capturing frames
+      await api("/api/start_recording", { fps: RECORD_FPS });
+
+      // Reset ball for a clean start
+      resetBall();
+
+      // Run the synchronous recording loop
+      await recordingLoop();
+
+      // Stop recording and get the video
+      recordProgress.textContent = "Encoding video…";
+      const res = await fetch("/api/stop_recording", { method: "POST" });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || res.statusText);
+      }
+      const blob = await res.blob();
+
+      // Trigger download
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "pong_recording.mp4";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(a.href);
+
+      recordProgress.textContent = "Done!";
+    } catch (e) {
+      recordProgress.textContent = "Error: " + e.message;
+    } finally {
+      isRecording = false;
+      lastTs = null; // reset RAF timestamp so game resumes smoothly
+      recordBtn.disabled = false;
+      recordBtn.textContent = "Record 10s";
+    }
+  });
 }
