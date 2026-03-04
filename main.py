@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import random
+import sqlite3
 import tempfile
 import threading
 from contextlib import asynccontextmanager
@@ -48,6 +49,9 @@ class State:
         self.loading = False
         self.error: Optional[str] = None
         self.lock = threading.Lock()
+
+        # Last displayed image (for Save to history)
+        self.current_image: Optional[Image.Image] = None
 
         # Set after /api/generate
         self.base_image: Optional[Image.Image] = None
@@ -87,6 +91,56 @@ class State:
 
 
 state = State()
+
+
+# ---------------------------------------------------------------------------
+# SQLite history persistence
+# ---------------------------------------------------------------------------
+
+_DB_PATH = os.path.join(os.path.dirname(__file__) or ".", "picdancer.db")
+db: sqlite3.Connection = None  # set in _init_db()
+db_lock = threading.Lock()
+
+
+def _init_db():
+    global db
+    db = sqlite3.connect(_DB_PATH, check_same_thread=False)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("""\
+        CREATE TABLE IF NOT EXISTS history (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            prompt      TEXT NOT NULL,
+            created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            image_png   BLOB NOT NULL,
+            thumb_jpeg  BLOB NOT NULL
+        )
+    """)
+    # Migrate: add columns for full latent-space state restoration
+    for col in [
+        "base_image_png BLOB",
+        "tx REAL DEFAULT 0",
+        "ty REAL DEFAULT 0",
+        "left_term TEXT DEFAULT ''",
+        "right_term TEXT DEFAULT ''",
+        "bottom_term TEXT DEFAULT ''",
+        "top_term TEXT DEFAULT ''",
+        "confinement REAL DEFAULT 0.5",
+    ]:
+        try:
+            db.execute(f"ALTER TABLE history ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    db.commit()
+    log.info(f"History DB ready at {_DB_PATH}")
+
+
+def _make_thumbnail(img: Image.Image, size: int = 80) -> bytes:
+    """Create an 80px square JPEG thumbnail."""
+    thumb = img.copy()
+    thumb.thumbnail((size, size), Image.LANCZOS)
+    buf = io.BytesIO()
+    thumb.save(buf, format="JPEG", quality=80)
+    return buf.getvalue()
 
 
 def load_model():
@@ -130,6 +184,7 @@ def load_model():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _init_db()
     thread = threading.Thread(target=load_model, daemon=True)
     thread.start()
     yield
@@ -222,8 +277,13 @@ def _build_time_ids(width, height):
 
 
 def _fast_img2img(cached_latents, prompt_embeds, pooled_prompt_embeds,
-                  num_steps, strength, seed, time_ids):
-    """Manual img2img loop — skips pipeline overhead, uses cached latents."""
+                  num_steps, strength, seed, time_ids, return_latents=False):
+    """Manual img2img loop — skips pipeline overhead, uses cached latents.
+
+    If return_latents=True, returns (image, raw_latents) where raw_latents
+    are the UNet output before VAE decode — suitable for reuse as
+    cached_latents without VAE round-trip quality loss.
+    """
     pipe = state.txt2img
     scheduler = pipe.scheduler
     unet = pipe.unet
@@ -256,6 +316,9 @@ def _fast_img2img(cached_latents, prompt_embeds, pooled_prompt_embeds,
         if latents.dtype != state.dtype:
             latents = latents.to(state.dtype)
 
+    # Capture raw UNet latents before VAE decode (for reuse as cached_latents)
+    raw_latents = latents.clone() if return_latents else None
+
     # VAE decode — temporarily upcast to float32 to avoid MPS NaN
     vae.to(dtype=torch.float32)
     latents = latents / vae.config.scaling_factor
@@ -263,6 +326,9 @@ def _fast_img2img(cached_latents, prompt_embeds, pooled_prompt_embeds,
     decoded = vae.decode(latents, return_dict=False)[0]
     vae.to(dtype=state.dtype)
     image = pipe.image_processor.postprocess(decoded, output_type="pil")[0]
+
+    if return_latents:
+        return image, raw_latents
     return image
 
 
@@ -332,6 +398,7 @@ def api_generate(req: GenerateRequest):
         img = result.images[0]
         state.base_image  = img
         state.base_prompt = req.prompt
+        state.current_image = img
 
         # Store prompt embeddings for later vector arithmetic
         state.base_embeds, state.base_pooled = encode_prompt(req.prompt)
@@ -476,6 +543,7 @@ def api_interpolate(req: InterpolateRequest):
 
     # t == 0 → return original image unchanged
     if req.value == 0.0:
+        state.current_image = state.base_image
         buf = io.BytesIO()
         state.base_image.save(buf, format="JPEG", quality=85 if fast else 92)
         return Response(content=buf.getvalue(), media_type="image/jpeg")
@@ -504,6 +572,7 @@ def api_interpolate(req: InterpolateRequest):
             img = _fast_img2img(cached_latents, interp_e, interp_p,
                                 steps, strength, req.seed, time_ids)
 
+    state.current_image = img
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85 if fast else 92)
     return Response(content=buf.getvalue(), media_type="image/jpeg")
@@ -555,6 +624,8 @@ class ExploreRequest(BaseModel):
     bottom_term: str = ""
     top_term:    str = ""
     confinement: float = 0.5
+    tx: float = 0.0   # current canvas position (for rebasing)
+    ty: float = 0.0
 
 
 @app.post("/api/set_explore")
@@ -563,6 +634,38 @@ def api_set_explore(req: ExploreRequest):
     require_base_image()
 
     with state.lock:
+        # Rebase: promote current position to new origin via arithmetic
+        # (renorm preserves embedding norm-sphere; no CLIP re-encode needed)
+        if req.tx != 0.0 or req.ty != 0.0:
+            log.info("Rebase: arithmetic  tx=%.2f ty=%.2f", req.tx, req.ty)
+            new_e = state.base_embeds.clone()
+            new_p = state.base_pooled.clone()
+            if state.direction_embeds is not None:
+                new_e = new_e + req.tx * state.direction_embeds
+                new_p = new_p + req.tx * state.direction_pooled
+            if state.direction2_embeds is not None:
+                new_e = new_e + req.ty * state.direction2_embeds
+                new_p = new_p + req.ty * state.direction2_pooled
+            state.base_embeds = _renorm(new_e, state.base_embeds)
+            state.base_pooled = _renorm(new_p, state.base_pooled)
+
+            # Keep original txt2img latents — any derived latents (VAE
+            # re-encode or img2img) cause cartoon-style drift.  Update
+            # base_image for the t=0 display shortcut only.
+            if state.current_image is not None:
+                state.base_image = state.current_image
+
+            # Update prompt context so subsequent _compute_direction
+            # encodes terms relative to the current semantic position.
+            terms = []
+            if abs(req.tx) >= 0.5 and state.start_term is not None:
+                terms.append(state.end_term if req.tx > 0 else state.start_term)
+            if abs(req.ty) >= 0.5 and state.start_term2 is not None:
+                terms.append(state.end_term2 if req.ty > 0 else state.start_term2)
+            if terms:
+                state.base_prompt = state.base_prompt + ", " + ", ".join(terms)
+            log.info("Rebase: prompt context now %r", state.base_prompt)
+
         # Axis 1 (left/right) — set or clear
         if req.left_term and req.right_term:
             state.direction_embeds, state.direction_pooled = _compute_direction(
@@ -610,6 +713,7 @@ def api_interpolate2d(req: Interpolate2DRequest):
     require_direction()
 
     if req.tx == 0.0 and req.ty == 0.0 and req.tz == 0.0:
+        state.current_image = state.base_image
         buf = io.BytesIO()
         state.base_image.save(buf, format="JPEG", quality=92)
         return Response(content=buf.getvalue(), media_type="image/jpeg")
@@ -642,9 +746,193 @@ def api_interpolate2d(req: Interpolate2DRequest):
             img = _fast_img2img(cached_latents, interp_e, interp_p,
                                 steps, strength, req.seed, time_ids)
 
+    state.current_image = img
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=92)
     return Response(content=buf.getvalue(), media_type="image/jpeg")
+
+
+# ---------------------------------------------------------------------------
+# API — history
+# ---------------------------------------------------------------------------
+
+class HistorySaveRequest(BaseModel):
+    tx: float = 0.0
+    ty: float = 0.0
+    confinement: float = 0.5
+
+
+@app.post("/api/history/save")
+def api_history_save(req: HistorySaveRequest):
+    if state.current_image is None:
+        raise HTTPException(400, detail="No image to save")
+    img = state.current_image
+    prompt = state.base_prompt or ""
+
+    # Serialize current (interpolated) image as PNG
+    png_buf = io.BytesIO()
+    img.save(png_buf, format="PNG")
+    png_bytes = png_buf.getvalue()
+
+    # Serialize base image as PNG (for restoring the original generation)
+    base_png_bytes = None
+    if state.base_image is not None:
+        base_buf = io.BytesIO()
+        state.base_image.save(base_buf, format="PNG")
+        base_png_bytes = base_buf.getvalue()
+
+    thumb_bytes = _make_thumbnail(img)
+
+    # Read axis terms from state
+    left_term   = state.start_term or ""
+    right_term  = state.end_term or ""
+    bottom_term = state.start_term2 or ""
+    top_term    = state.end_term2 or ""
+
+    with db_lock:
+        cur = db.execute(
+            """INSERT INTO history
+               (prompt, image_png, thumb_jpeg, base_image_png,
+                tx, ty, left_term, right_term, bottom_term, top_term, confinement)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (prompt, png_bytes, thumb_bytes, base_png_bytes,
+             req.tx, req.ty, left_term, right_term, bottom_term, top_term, req.confinement),
+        )
+        db.commit()
+        row = db.execute(
+            "SELECT id, created_at FROM history WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+
+    return {
+        "id": row[0],
+        "created_at": row[1],
+        "thumb": base64.b64encode(thumb_bytes).decode(),
+    }
+
+
+@app.get("/api/history")
+def api_history_list():
+    rows = db.execute(
+        "SELECT id, prompt, created_at, thumb_jpeg FROM history ORDER BY id DESC"
+    ).fetchall()
+    return [
+        {
+            "id": r[0],
+            "prompt": r[1],
+            "created_at": r[2],
+            "thumb": base64.b64encode(r[3]).decode(),
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/history/{item_id}/image")
+def api_history_image(item_id: int):
+    row = db.execute(
+        "SELECT image_png FROM history WHERE id = ?", (item_id,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, detail="Not found")
+    return Response(content=row[0], media_type="image/png")
+
+
+@app.post("/api/history/{item_id}/restore")
+def api_history_restore(item_id: int):
+    require_model()
+    row = db.execute(
+        """SELECT prompt, image_png, base_image_png,
+                  tx, ty, left_term, right_term, bottom_term, top_term, confinement
+           FROM history WHERE id = ?""",
+        (item_id,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, detail="Not found")
+
+    prompt = row[0]
+    interp_png = row[1]
+    base_png = row[2]
+    tx = row[3] or 0.0
+    ty = row[4] or 0.0
+    left_term = row[5] or ""
+    right_term = row[6] or ""
+    bottom_term = row[7] or ""
+    top_term = row[8] or ""
+    confinement = row[9] if row[9] is not None else 0.5
+
+    # Use saved base image if available, otherwise fall back to interpolated image (old rows)
+    base_bytes = base_png if base_png else interp_png
+    base_img = Image.open(io.BytesIO(base_bytes)).convert("RGB")
+    interp_img = Image.open(io.BytesIO(interp_png)).convert("RGB")
+
+    with state.lock:
+        state.base_image = base_img
+        state.base_prompt = prompt
+        state.current_image = interp_img
+
+        # Re-encode prompt through CLIP
+        state.base_embeds, state.base_pooled = encode_prompt(prompt)
+
+        # Re-encode base image through VAE at both resolutions
+        state.base_latents_512 = _encode_image_to_latents(state.txt2img, base_img)
+        state.time_ids_512 = _build_time_ids(512, 512)
+
+        img_256 = base_img.resize((256, 256), Image.LANCZOS)
+        state.base_image_256 = img_256
+        state.base_latents_256 = _encode_image_to_latents(state.txt2img, img_256)
+        state.time_ids_256 = _build_time_ids(256, 256)
+
+        # Restore axis directions if terms were saved
+        has_dir1 = bool(left_term and right_term)
+        has_dir2 = bool(bottom_term and top_term)
+
+        if has_dir1:
+            state.direction_embeds, state.direction_pooled = _compute_direction(
+                left_term, right_term, confinement)
+            state.start_term = left_term
+            state.end_term = right_term
+        else:
+            state.direction_embeds = None
+            state.direction_pooled = None
+            state.start_term = None
+            state.end_term = None
+
+        if has_dir2:
+            state.direction2_embeds, state.direction2_pooled = _compute_direction(
+                bottom_term, top_term, confinement)
+            state.start_term2 = bottom_term
+            state.end_term2 = top_term
+        else:
+            state.direction2_embeds = None
+            state.direction2_pooled = None
+            state.start_term2 = None
+            state.end_term2 = None
+
+        # Clear axis 3 (not used on main page)
+        state.direction3_embeds = None
+        state.direction3_pooled = None
+        state.start_term3 = None
+        state.end_term3 = None
+
+    return {
+        "status": "ok",
+        "prompt": prompt,
+        "tx": tx,
+        "ty": ty,
+        "left_term": left_term,
+        "right_term": right_term,
+        "bottom_term": bottom_term,
+        "top_term": top_term,
+        "has_direction": has_dir1,
+        "has_direction2": has_dir2,
+    }
+
+
+@app.delete("/api/history/{item_id}")
+def api_history_delete(item_id: int):
+    with db_lock:
+        db.execute("DELETE FROM history WHERE id = ?", (item_id,))
+        db.commit()
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------
