@@ -550,12 +550,14 @@ async function renderImage(tx, ty, tz) {
   interpStatus.textContent = parts.join("  ") + " …";
   try {
     const { strength, num_steps } = getInterpSettings();
+    const subject_lock = parseInt(localStorage.getItem("latentacle-subject") || "50", 10) / 100;
     const url = await fetchImage("/api/interpolate2d", {
       tx,
       ty: hasDirection2 ? ty : 0,
       tz: 0,
       strength,
       num_steps,
+      subject_lock,
     });
     showImageUrl(url);
   } catch (e) {
@@ -614,12 +616,14 @@ async function recordingLoop() {
 
     const { tx, ty } = ballToT();
     const { strength, num_steps } = getInterpSettings();
+    const subject_lock = parseInt(localStorage.getItem("latentacle-subject") || "50", 10) / 100;
     const url = await fetchImage("/api/interpolate2d", {
       tx,
       ty: hasDirection2 ? ty : 0,
       tz: 0,
       strength,
       num_steps,
+      subject_lock,
     });
     showImageUrl(url);
 

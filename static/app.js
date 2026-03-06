@@ -23,6 +23,7 @@ const rightIn      = $("right-term");
 const bottomIn     = $("bottom-term");
 const topIn        = $("top-term");
 const setBtn       = $("set-btn");
+const clearBtn     = $("clear-btn");
 const strengthSlider = $("strength-slider");
 const strengthVal    = $("strength-val");
 const interpSteps    = $("interp-steps");
@@ -31,6 +32,11 @@ const scaleSlider    = $("scale-slider");
 const scaleVal       = $("scale-val");
 const confinementSlider = $("confinement-slider");
 const confinementVal    = $("confinement-val");
+const subjectSlider     = $("subject-slider");
+const subjectVal        = $("subject-val");
+const saveBtn           = $("save-btn");
+const downloadBtn       = $("download-btn");
+const historyStrip      = $("history-strip");
 
 const canvas   = $("explore-canvas");
 const ctx      = canvas.getContext("2d");
@@ -46,6 +52,12 @@ const savedConfinement = localStorage.getItem("latentacle-confinement");
 if (savedConfinement !== null) {
   confinementSlider.value = savedConfinement;
   confinementVal.textContent = (parseInt(savedConfinement, 10) / 100).toFixed(2);
+}
+
+const savedSubject = localStorage.getItem("latentacle-subject");
+if (savedSubject !== null) {
+  subjectSlider.value = savedSubject;
+  subjectVal.textContent = (parseInt(savedSubject, 10) / 100).toFixed(2);
 }
 
 // ── State ─────────────────────────────────────────
@@ -127,6 +139,8 @@ function setError(msg) {
 
 function updateUI() {
   generateBtn.disabled = isBusy || !modelReady;
+  saveBtn.disabled = !hasBaseImage || isBusy;
+  downloadBtn.disabled = !hasBaseImage;
   if (hasBaseImage && !isBusy) {
     axisRow.classList.remove("disabled");
     setBtn.disabled = false;
@@ -249,18 +263,22 @@ setBtn.addEventListener("click", async () => {
   setBtn.disabled = true;
   setBtn.textContent = "Computing…";
   try {
+    // Pass current position so the backend rebases embeddings to preserve
+    // the current image as the new origin before computing new directions.
+    const { tx, ty } = axesReady ? curToT() : { tx: 0, ty: 0 };
     await api("/api/set_explore", {
       left_term: left, right_term: right,
       bottom_term: bottom, top_term: top,
       confinement: parseInt(confinementSlider.value, 10) / 100,
+      tx, ty,
     });
     axisXReady = hasX;
     axisYReady = hasY;
     axesReady = true;
+    // Canvas resets to centre — the rebased origin matches the current image.
     rendered = null;
     cur = { x: W / 2, y: H / 2 };
     draw();
-    scheduleUpdate();
   } catch (e) {
     statusBadge.textContent = "Error: " + e.message;
     statusBadge.className = "badge error";
@@ -291,6 +309,30 @@ scaleSlider.addEventListener("input", () => {
 confinementSlider.addEventListener("input", () => {
   confinementVal.textContent = (parseInt(confinementSlider.value, 10) / 100).toFixed(2);
   localStorage.setItem("latentacle-confinement", confinementSlider.value);
+});
+
+subjectSlider.addEventListener("input", () => {
+  subjectVal.textContent = (parseInt(subjectSlider.value, 10) / 100).toFixed(2);
+  localStorage.setItem("latentacle-subject", subjectSlider.value);
+});
+
+clearBtn.addEventListener("click", () => {
+  promptInput.value = "";
+  seedInput.value = "";
+  leftIn.value = "";
+  rightIn.value = "";
+  bottomIn.value = "";
+  topIn.value = "";
+  hasBaseImage = false;
+  axesReady = false;
+  axisXReady = false;
+  axisYReady = false;
+  rendered = null;
+  cur = { x: W / 2, y: H / 2 };
+  resultImg.style.display = "none";
+  imagePlaceholder.style.display = "";
+  draw();
+  updateUI();
 });
 
 leftIn.addEventListener(  "keydown", e => { if (e.key === "Enter") rightIn.focus(); });
@@ -412,6 +454,7 @@ async function renderImage(tx, ty, cx, cy) {
       tx, ty,
       strength: parseInt(strengthSlider.value, 10) / 100,
       num_steps: parseInt(interpSteps.value, 10),
+      subject_lock: parseInt(subjectSlider.value, 10) / 100,
     });
     showImageUrl(url);
     rendered = { x: cx, y: cy };
@@ -427,3 +470,116 @@ async function renderImage(tx, ty, cx, cy) {
     }
   }
 }
+
+// ── Save / Download / History ─────────────────────
+saveBtn.addEventListener("click", async () => {
+  if (!hasBaseImage) return;
+  saveBtn.disabled = true;
+  saveBtn.textContent = "Saving…";
+  try {
+    const { tx, ty } = curToT();
+    const data = await api("/api/history/save", {
+      tx, ty,
+      confinement: parseInt(confinementSlider.value, 10) / 100,
+    });
+    addHistoryThumb(data.id, data.thumb);
+  } catch (e) {
+    setError(e.message);
+  } finally {
+    saveBtn.disabled = false;
+    saveBtn.textContent = "Save";
+  }
+});
+
+downloadBtn.addEventListener("click", () => {
+  if (!resultImg.src) return;
+  const a = document.createElement("a");
+  a.href = resultImg.src;
+  a.download = "latentacle.png";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+});
+
+function addHistoryThumb(id, thumbB64) {
+  const div = document.createElement("div");
+  div.className = "hist-thumb";
+  div.dataset.id = id;
+
+  const img = document.createElement("img");
+  img.src = "data:image/jpeg;base64," + thumbB64;
+  div.appendChild(img);
+
+  const del = document.createElement("button");
+  del.className = "hist-delete";
+  del.textContent = "\u00d7";
+  del.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    try {
+      await fetch(`/api/history/${id}`, { method: "DELETE" });
+      div.remove();
+    } catch (_) {}
+  });
+  div.appendChild(del);
+
+  div.addEventListener("click", () => restoreHistory(id));
+
+  // Insert at the start (most recent first)
+  historyStrip.prepend(div);
+}
+
+async function restoreHistory(id) {
+  isBusy = true;
+  updateUI();
+  showSpinner("Restoring…");
+  try {
+    const data = await api(`/api/history/${id}/restore`, {});
+
+    // Show the saved image
+    const res = await fetch(`/api/history/${id}/image`);
+    const blob = await res.blob();
+    if (_prevBlobUrl) URL.revokeObjectURL(_prevBlobUrl);
+    _prevBlobUrl = URL.createObjectURL(blob);
+    showImageUrl(_prevBlobUrl);
+
+    // Restore UI fields
+    if (data.prompt) promptInput.value = data.prompt;
+    leftIn.value   = data.left_term || "";
+    rightIn.value  = data.right_term || "";
+    bottomIn.value = data.bottom_term || "";
+    topIn.value    = data.top_term || "";
+
+    hasBaseImage = true;
+    axisXReady = data.has_direction;
+    axisYReady = data.has_direction2;
+    axesReady  = axisXReady || axisYReady;
+
+    // Restore canvas position
+    const tx = data.tx || 0;
+    const ty = data.ty || 0;
+    cur.x = (tx / (2 * T_RANGE) + 0.5) * W;
+    cur.y = (-ty / (2 * T_RANGE) + 0.5) * H;
+    rendered = { x: cur.x, y: cur.y };
+    draw();
+  } catch (e) {
+    setError(e.message);
+  } finally {
+    hideSpinner();
+    isBusy = false;
+    updateUI();
+  }
+}
+
+async function loadHistory() {
+  try {
+    const items = await api("/api/history");
+    historyStrip.innerHTML = "";
+    // Items come newest-first from the API; addHistoryThumb prepends,
+    // so iterate in reverse to end up with newest on the left.
+    for (let i = items.length - 1; i >= 0; i--) {
+      addHistoryThumb(items[i].id, items[i].thumb);
+    }
+  } catch (_) {}
+}
+
+loadHistory();

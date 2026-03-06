@@ -9,12 +9,13 @@
     #app {
       display: inline-grid;
       grid-template-columns: 420px 420px;
-      grid-template-rows: auto auto auto auto;
+      grid-template-rows: auto auto auto auto auto;
       grid-template-areas:
         "header   header"
         "generate generate"
         "axis     axis"
-        "canvas   image";
+        "canvas   image"
+        "history  history";
       gap: 0.5rem;
     }
 
@@ -22,6 +23,7 @@
     #axis-row      { grid-area: axis; }
     #canvas-col    { grid-area: canvas; display: flex; flex-direction: column; gap: 0.3rem; }
     #image-section { grid-area: image; }
+    #history-row   { grid-area: history; }
 
     #explore-canvas {
       display: block;
@@ -48,6 +50,65 @@
       flex-shrink: 0;
       padding: 0 0.1rem;
     }
+
+    /* ── Action buttons row ───────────────── */
+    #image-actions {
+      display: flex;
+      gap: 0.35rem;
+      justify-content: flex-end;
+    }
+    #image-actions button {
+      font-size: 0.7rem;
+      padding: 0.25rem 0.6rem;
+    }
+
+    /* ── History strip ────────────────────── */
+    #history-row {
+      min-height: 0;
+    }
+    #history-strip {
+      display: flex;
+      gap: 0.35rem;
+      overflow-x: auto;
+      padding: 0.3rem 0;
+    }
+    #history-strip:empty { display: none; }
+    .hist-thumb {
+      position: relative;
+      flex-shrink: 0;
+      width: 72px;
+      height: 72px;
+      border-radius: 4px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+    .hist-thumb:hover { border-color: var(--accent); }
+    .hist-thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .hist-delete {
+      display: none;
+      position: absolute;
+      top: 2px;
+      right: 2px;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: rgba(240,80,96,0.85);
+      color: #fff;
+      font-size: 11px;
+      line-height: 18px;
+      text-align: center;
+      cursor: pointer;
+      border: none;
+      padding: 0;
+    }
+    .hist-thumb:hover .hist-delete { display: block; }
   </style>
 </head>
 <body>
@@ -90,6 +151,7 @@
         <input id="bottom-term" type="text" placeholder="bottom…" autocomplete="off" />
         <input id="top-term"    type="text" placeholder="top…"    autocomplete="off" />
         <button id="set-btn" disabled>Set axes</button>
+        <button id="clear-btn" style="background:transparent;border:1px solid var(--border);color:var(--muted);font-weight:400">Clear</button>
       </div>
       <div class="row subtle">
         <label>Strength
@@ -107,6 +169,10 @@
         <label>Confine
           <input id="confinement-slider" type="range" min="0" max="100" step="5" value="50" />
           <span id="confinement-val">0.50</span>
+        </label>
+        <label>Subject
+          <input id="subject-slider" type="range" min="0" max="100" step="5" value="50" />
+          <span id="subject-val">0.50</span>
         </label>
       </div>
     </section>
@@ -127,10 +193,19 @@
           <p id="spinner-label">Generating…</p>
         </div>
       </div>
+      <div id="image-actions">
+        <button id="save-btn" disabled>Save</button>
+        <button id="download-btn" disabled>Download</button>
+      </div>
       <p id="interp-status"></p>
     </section>
 
+    <!-- ── History ─────────────────────────────── -->
+    <section id="history-row">
+      <div id="history-strip"></div>
+    </section>
+
   </div>
-  <script src="/static/app.js?v=2"></script>
+  <script src="/static/app.js?v=5"></script>
 </body>
 </html>

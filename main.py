@@ -30,6 +30,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
+from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
@@ -83,6 +84,9 @@ class State:
         self.direction3_pooled: Optional[torch.Tensor] = None
         self.start_term3: Optional[str] = None
         self.end_term3: Optional[str] = None
+
+        # IP-Adapter cached image embeddings
+        self.ip_adapter_embeds: Optional[list] = None
 
         # Recording state
         self.recording_frames: list = []
@@ -166,6 +170,23 @@ def load_model():
         ).to(device)
 
         state.img2img = AutoPipelineForImage2Image.from_pipe(state.txt2img)
+
+        # Load IP-Adapter for subject preservation
+        log.info("Loading IP-Adapter (ip-adapter-plus_sdxl_vit-h) …")
+        image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+            "h94/IP-Adapter",
+            subfolder="models/image_encoder",
+            torch_dtype=dtype,
+        ).to(device)
+        state.txt2img.image_encoder = image_encoder
+        state.txt2img.feature_extractor = CLIPImageProcessor()
+        state.txt2img.load_ip_adapter(
+            "h94/IP-Adapter",
+            subfolder="sdxl_models",
+            weight_name="ip-adapter-plus_sdxl_vit-h.safetensors",
+        )
+        state.txt2img.set_ip_adapter_scale(0.5)
+        log.info("IP-Adapter loaded.")
 
         state.device = device
         state.dtype = dtype
@@ -306,6 +327,8 @@ def _fast_img2img(cached_latents, prompt_embeds, pooled_prompt_embeds,
 
     # UNet denoising loop (no CFG — guidance_scale=0.0)
     added_cond_kwargs = {"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
+    if state.ip_adapter_embeds is not None:
+        added_cond_kwargs["image_embeds"] = state.ip_adapter_embeds
     for t in timesteps:
         model_input = scheduler.scale_model_input(latents, t)
         noise_pred = unet(model_input, t,
@@ -385,6 +408,10 @@ def api_generate(req: GenerateRequest):
         gen = torch.Generator(device=state.device)
         gen.manual_seed(req.seed if req.seed is not None else random.randint(0, 2**32 - 1))
 
+        # IP-Adapter: UNet requires image_embeds even during txt2img;
+        # pass a dummy image with scale=0 so it has no effect.
+        state.txt2img.set_ip_adapter_scale(0.0)
+        dummy_ip = Image.new("RGB", (224, 224), (128, 128, 128))
         with torch.inference_mode():
             result = state.txt2img(
                 prompt=req.prompt,
@@ -393,6 +420,7 @@ def api_generate(req: GenerateRequest):
                 width=req.width,
                 height=req.height,
                 generator=gen,
+                ip_adapter_image=[dummy_ip],
             )
 
         img = result.images[0]
@@ -411,6 +439,16 @@ def api_generate(req: GenerateRequest):
         state.base_image_256 = img_256
         state.base_latents_256 = _encode_image_to_latents(state.txt2img, img_256)
         state.time_ids_256 = _build_time_ids(256, 256)
+
+        # Cache IP-Adapter image embeddings (CLIP ViT-H encoding of base image)
+        with torch.no_grad():
+            state.ip_adapter_embeds = state.txt2img.prepare_ip_adapter_image_embeds(
+                ip_adapter_image=[img],
+                ip_adapter_image_embeds=None,
+                device=state.device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=False,
+            )
 
         # Reset all directions when base image changes
         state.direction_embeds  = None
@@ -531,6 +569,7 @@ class InterpolateRequest(BaseModel):
     num_steps: int = 3
     seed: int = 42        # fixed seed for reproducible noise across slider positions
     quality: str = "full" # "fast" (256px, 2 steps) or "full" (512px, user steps)
+    subject_lock: float = 0.5  # IP-Adapter scale: 0=off, 1=max subject preservation
 
 
 @app.post("/api/interpolate")
@@ -568,6 +607,7 @@ def api_interpolate(req: InterpolateRequest):
             dtype=state.dtype, device=state.device
         )
 
+        state.txt2img.set_ip_adapter_scale(req.subject_lock)
         with torch.inference_mode():
             img = _fast_img2img(cached_latents, interp_e, interp_p,
                                 steps, strength, req.seed, time_ids)
@@ -704,6 +744,7 @@ class Interpolate2DRequest(BaseModel):
     strength: float = 0.80
     num_steps: int = 3
     seed: int = 42
+    subject_lock: float = 0.5  # IP-Adapter scale: 0=off, 1=max subject preservation
 
 
 @app.post("/api/interpolate2d")
@@ -742,6 +783,7 @@ def api_interpolate2d(req: Interpolate2DRequest):
         interp_e = _renorm(interp_e, state.base_embeds).to(dtype=state.dtype, device=state.device)
         interp_p = _renorm(interp_p, state.base_pooled).to(dtype=state.dtype, device=state.device)
 
+        state.txt2img.set_ip_adapter_scale(req.subject_lock)
         with torch.inference_mode():
             img = _fast_img2img(cached_latents, interp_e, interp_p,
                                 steps, strength, req.seed, time_ids)
@@ -880,6 +922,16 @@ def api_history_restore(item_id: int):
         state.base_image_256 = img_256
         state.base_latents_256 = _encode_image_to_latents(state.txt2img, img_256)
         state.time_ids_256 = _build_time_ids(256, 256)
+
+        # Cache IP-Adapter image embeddings for restored base image
+        with torch.no_grad():
+            state.ip_adapter_embeds = state.txt2img.prepare_ip_adapter_image_embeds(
+                ip_adapter_image=[base_img],
+                ip_adapter_image_embeds=None,
+                device=state.device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=False,
+            )
 
         # Restore axis directions if terms were saved
         has_dir1 = bool(left_term and right_term)
