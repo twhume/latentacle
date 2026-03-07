@@ -298,7 +298,8 @@ def _build_time_ids(width, height):
 
 
 def _fast_img2img(cached_latents, prompt_embeds, pooled_prompt_embeds,
-                  num_steps, strength, seed, time_ids, return_latents=False):
+                  num_steps, strength, seed, time_ids, return_latents=False,
+                  subject_lock=0.5):
     """Manual img2img loop — skips pipeline overhead, uses cached latents.
 
     If return_latents=True, returns (image, raw_latents) where raw_latents
@@ -326,10 +327,18 @@ def _fast_img2img(cached_latents, prompt_embeds, pooled_prompt_embeds,
     latents = scheduler.add_noise(cached_latents, noise, latent_timestep)
 
     # UNet denoising loop (no CFG — guidance_scale=0.0)
+    # IP-Adapter: ramp scale from 0 (early/noisy → text drives structure)
+    # to full subject_lock (late/clean → image preserves identity).
+    # Inspired by SDEdit strategy from Text Slider (arXiv 2509.18831).
     added_cond_kwargs = {"text_embeds": pooled_prompt_embeds, "time_ids": time_ids}
-    if state.ip_adapter_embeds is not None:
+    has_ip = state.ip_adapter_embeds is not None
+    if has_ip:
         added_cond_kwargs["image_embeds"] = state.ip_adapter_embeds
-    for t in timesteps:
+    n_steps = len(timesteps)
+    for i, t in enumerate(timesteps):
+        if has_ip and subject_lock > 0:
+            frac = i / max(n_steps - 1, 1)
+            pipe.set_ip_adapter_scale(frac * subject_lock)
         model_input = scheduler.scale_model_input(latents, t)
         noise_pred = unet(model_input, t,
                           encoder_hidden_states=prompt_embeds,
@@ -451,6 +460,72 @@ def api_generate(req: GenerateRequest):
             )
 
         # Reset all directions when base image changes
+        state.direction_embeds  = None
+        state.direction_pooled  = None
+        state.start_term        = None
+        state.end_term          = None
+        state.direction2_embeds = None
+        state.direction2_pooled = None
+        state.start_term2       = None
+        state.end_term2         = None
+        state.direction3_embeds = None
+        state.direction3_pooled = None
+        state.start_term3       = None
+        state.end_term3         = None
+
+    return {"image": img_to_b64(img)}
+
+
+# ---------------------------------------------------------------------------
+# API — upload image
+# ---------------------------------------------------------------------------
+
+@app.post("/api/upload")
+async def api_upload(request: Request):
+    """Accept an uploaded image, project it into the model's latent space,
+    and set it as the base image for exploration."""
+    require_model()
+
+    body = await request.body()
+    try:
+        img = Image.open(io.BytesIO(body)).convert("RGB")
+    except Exception:
+        raise HTTPException(400, detail="Invalid image file")
+
+    # Resize to 512×512 (model native resolution)
+    img = img.resize((512, 512), Image.LANCZOS)
+
+    # Read prompt from query param (optional context for direction encoding)
+    prompt = request.query_params.get("prompt", "")
+
+    with state.lock:
+        state.base_image = img
+        state.base_prompt = prompt
+        state.current_image = img
+
+        # Encode prompt (may be empty — gives a neutral baseline for direction arithmetic)
+        state.base_embeds, state.base_pooled = encode_prompt(prompt)
+
+        # Project image into VAE latent space at both resolutions
+        state.base_latents_512 = _encode_image_to_latents(state.txt2img, img)
+        state.time_ids_512 = _build_time_ids(512, 512)
+
+        img_256 = img.resize((256, 256), Image.LANCZOS)
+        state.base_image_256 = img_256
+        state.base_latents_256 = _encode_image_to_latents(state.txt2img, img_256)
+        state.time_ids_256 = _build_time_ids(256, 256)
+
+        # Cache IP-Adapter image embeddings
+        with torch.no_grad():
+            state.ip_adapter_embeds = state.txt2img.prepare_ip_adapter_image_embeds(
+                ip_adapter_image=[img],
+                ip_adapter_image_embeds=None,
+                device=state.device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=False,
+            )
+
+        # Reset all directions
         state.direction_embeds  = None
         state.direction_pooled  = None
         state.start_term        = None
@@ -607,10 +682,10 @@ def api_interpolate(req: InterpolateRequest):
             dtype=state.dtype, device=state.device
         )
 
-        state.txt2img.set_ip_adapter_scale(req.subject_lock)
         with torch.inference_mode():
             img = _fast_img2img(cached_latents, interp_e, interp_p,
-                                steps, strength, req.seed, time_ids)
+                                steps, strength, req.seed, time_ids,
+                                subject_lock=req.subject_lock)
 
     state.current_image = img
     buf = io.BytesIO()
@@ -674,20 +749,24 @@ def api_set_explore(req: ExploreRequest):
     require_base_image()
 
     with state.lock:
-        # Rebase: promote current position to new origin via arithmetic
-        # (renorm preserves embedding norm-sphere; no CLIP re-encode needed)
+        # Rebase: promote current position to new origin.
+        # Arithmetic rebase (add direction vectors) drifts off the CLIP
+        # manifold after repeated applications.  We blend the arithmetic
+        # result with a fresh CLIP re-encoding of the accumulated prompt
+        # to snap back toward the trained manifold while preserving the
+        # approximate semantic position.
         if req.tx != 0.0 or req.ty != 0.0:
-            log.info("Rebase: arithmetic  tx=%.2f ty=%.2f", req.tx, req.ty)
-            new_e = state.base_embeds.clone()
-            new_p = state.base_pooled.clone()
+            log.info("Rebase: tx=%.2f ty=%.2f", req.tx, req.ty)
+            arith_e = state.base_embeds.clone()
+            arith_p = state.base_pooled.clone()
             if state.direction_embeds is not None:
-                new_e = new_e + req.tx * state.direction_embeds
-                new_p = new_p + req.tx * state.direction_pooled
+                arith_e = arith_e + req.tx * state.direction_embeds
+                arith_p = arith_p + req.tx * state.direction_pooled
             if state.direction2_embeds is not None:
-                new_e = new_e + req.ty * state.direction2_embeds
-                new_p = new_p + req.ty * state.direction2_pooled
-            state.base_embeds = _renorm(new_e, state.base_embeds)
-            state.base_pooled = _renorm(new_p, state.base_pooled)
+                arith_e = arith_e + req.ty * state.direction2_embeds
+                arith_p = arith_p + req.ty * state.direction2_pooled
+            arith_e = _renorm(arith_e, state.base_embeds)
+            arith_p = _renorm(arith_p, state.base_pooled)
 
             # Keep original txt2img latents — any derived latents (VAE
             # re-encode or img2img) cause cartoon-style drift.  Update
@@ -705,6 +784,18 @@ def api_set_explore(req: ExploreRequest):
             if terms:
                 state.base_prompt = state.base_prompt + ", " + ", ".join(terms)
             log.info("Rebase: prompt context now %r", state.base_prompt)
+
+            # Manifold correction: blend arithmetic result with fresh CLIP
+            # encoding of the accumulated prompt.  This prevents multi-rebase
+            # drift while keeping the semantic position approximately right.
+            _REBASE_BLEND = 0.5  # 0 = pure arithmetic, 1 = pure re-encode
+            fresh_e, fresh_p = encode_prompt(state.base_prompt)
+            state.base_embeds = _renorm(
+                (1 - _REBASE_BLEND) * arith_e + _REBASE_BLEND * fresh_e,
+                arith_e)
+            state.base_pooled = _renorm(
+                (1 - _REBASE_BLEND) * arith_p + _REBASE_BLEND * fresh_p,
+                arith_p)
 
         # Axis 1 (left/right) — set or clear
         if req.left_term and req.right_term:
@@ -783,10 +874,10 @@ def api_interpolate2d(req: Interpolate2DRequest):
         interp_e = _renorm(interp_e, state.base_embeds).to(dtype=state.dtype, device=state.device)
         interp_p = _renorm(interp_p, state.base_pooled).to(dtype=state.dtype, device=state.device)
 
-        state.txt2img.set_ip_adapter_scale(req.subject_lock)
         with torch.inference_mode():
             img = _fast_img2img(cached_latents, interp_e, interp_p,
-                                steps, strength, req.seed, time_ids)
+                                steps, strength, req.seed, time_ids,
+                                subject_lock=req.subject_lock)
 
     state.current_image = img
     buf = io.BytesIO()

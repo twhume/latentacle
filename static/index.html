@@ -127,6 +127,8 @@
       <div class="row">
         <input id="prompt" type="text" placeholder="Describe the image…" autocomplete="off" />
         <button id="generate-btn" disabled>Generate</button>
+        <input id="upload-input" type="file" accept="image/*" hidden />
+        <button id="upload-btn" disabled>Upload</button>
       </div>
       <div class="row subtle">
         <label>Steps
@@ -206,6 +208,6 @@
     </section>
 
   </div>
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=6"></script>
 </body>
 </html>

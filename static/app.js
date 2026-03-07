@@ -5,6 +5,8 @@ const $  = id => document.getElementById(id);
 
 const statusBadge      = $("status-badge");
 const generateBtn      = $("generate-btn");
+const uploadBtn        = $("upload-btn");
+const uploadInput      = $("upload-input");
 const promptInput      = $("prompt");
 const seedInput        = $("seed");
 const genSteps         = $("gen-steps");
@@ -139,6 +141,7 @@ function setError(msg) {
 
 function updateUI() {
   generateBtn.disabled = isBusy || !modelReady;
+  uploadBtn.disabled = isBusy || !modelReady;
   saveBtn.disabled = !hasBaseImage || isBusy;
   downloadBtn.disabled = !hasBaseImage;
   if (hasBaseImage && !isBusy) {
@@ -238,6 +241,47 @@ generateBtn.addEventListener("click", async () => {
 
 promptInput.addEventListener("keydown", e => {
   if (e.key === "Enter") generateBtn.click();
+});
+
+// ── Upload ───────────────────────────────────────
+uploadBtn.addEventListener("click", () => uploadInput.click());
+
+uploadInput.addEventListener("change", async () => {
+  const file = uploadInput.files[0];
+  if (!file) return;
+  uploadInput.value = "";  // allow re-selecting same file
+
+  isBusy = true;
+  updateUI();
+  showSpinner("Uploading…");
+  try {
+    const prompt = promptInput.value.trim();
+    const res = await fetch(`/api/upload?prompt=${encodeURIComponent(prompt)}`, {
+      method: "POST",
+      headers: { "Content-Type": file.type },
+      body: file,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || res.statusText);
+    }
+    const data = await res.json();
+    showImage(data.image);
+    hasBaseImage = true;
+    axesReady = false;
+    axisXReady = false;
+    axisYReady = false;
+    rendered = null;
+    cur = { x: W / 2, y: H / 2 };
+    draw();
+    updateUI();
+  } catch (e) {
+    setError(e.message);
+  } finally {
+    hideSpinner();
+    isBusy = false;
+    updateUI();
+  }
 });
 
 // ── Set axes ──────────────────────────────────────
