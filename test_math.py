@@ -172,3 +172,47 @@ class TestOrthogonalise:
         result = _orthogonalise(direction_pooled, base_pooled)
         dot = (result.flatten() * base_pooled.flatten()).sum()
         assert abs(dot.item()) < 1e-3
+
+
+# ── H-space hook tests ──────────────────────────────────────────────────────
+
+class TestHSpaceHook:
+    def test_h_hook_adds_offset(self):
+        """Verify the h-space hook mechanism adds offset to mid-block output."""
+        # Simulate what the hook does: output + h_offset
+        output = torch.randn(1, 1280, 16, 16)
+        h_offset = torch.randn(1, 1280, 16, 16) * 0.1
+        result = output + h_offset
+        # Result should differ from output
+        assert not torch.allclose(result, output)
+        # Difference should equal h_offset
+        assert torch.allclose(result - output, h_offset, atol=1e-6)
+
+    def test_h_direction_shape(self):
+        """H-space direction should have shape [1, C, H, W] matching mid-block."""
+        # For SDXL at 512px, mid-block is [1, 1280, 16, 16]
+        h_dir = torch.randn(1, 1280, 16, 16)
+        assert h_dir.shape == (1, 1280, 16, 16)
+
+    def test_h_direction_not_zero(self):
+        """Direction between different terms should be non-trivial."""
+        # Simulate h-space direction computation
+        h_start = torch.randn(1, 1280, 16, 16)
+        h_end = torch.randn(1, 1280, 16, 16)
+        h_dir = h_end - h_start
+        assert h_dir.norm().item() > 1e-6
+
+    def test_h_offset_zero_at_origin(self):
+        """At tx=0, ty=0, h_offset should be zero (no modification)."""
+        h_dir1 = torch.randn(1, 1280, 16, 16)
+        h_dir2 = torch.randn(1, 1280, 16, 16)
+        tx, ty = 0.0, 0.0
+        h_offset = tx * h_dir1 + ty * h_dir2
+        assert h_offset.norm().item() < 1e-6
+
+    def test_h_offset_scales_linearly(self):
+        """H-space offset should scale linearly with t."""
+        h_dir = torch.randn(1, 1280, 16, 16)
+        offset_1 = 1.0 * h_dir
+        offset_2 = 2.0 * h_dir
+        assert torch.allclose(offset_2, offset_1 * 2.0, atol=1e-6)

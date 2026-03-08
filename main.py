@@ -88,6 +88,12 @@ class State:
         # IP-Adapter cached image embeddings
         self.ip_adapter_embeds: Optional[list] = None
 
+        # H-space (UNet mid-block) direction vectors
+        self.h_direction1: Optional[torch.Tensor] = None  # axis 1
+        self.h_direction2: Optional[torch.Tensor] = None  # axis 2
+        self.h_direction3: Optional[torch.Tensor] = None  # axis 3
+        self.editing_space: str = "clip"  # "clip" or "hspace"
+
         # Recording state
         self.recording_frames: list = []
         self.is_recording: bool = False
@@ -299,12 +305,15 @@ def _build_time_ids(width, height):
 
 def _fast_img2img(cached_latents, prompt_embeds, pooled_prompt_embeds,
                   num_steps, strength, seed, time_ids, return_latents=False,
-                  subject_lock=0.5):
+                  subject_lock=0.5, h_offset=None):
     """Manual img2img loop — skips pipeline overhead, uses cached latents.
 
     If return_latents=True, returns (image, raw_latents) where raw_latents
     are the UNet output before VAE decode — suitable for reuse as
     cached_latents without VAE round-trip quality loss.
+
+    If h_offset is provided, it's added to UNet mid-block activations
+    via a forward hook (h-space editing).
     """
     pipe = state.txt2img
     scheduler = pipe.scheduler
@@ -325,6 +334,13 @@ def _fast_img2img(cached_latents, prompt_embeds, pooled_prompt_embeds,
     noise = randn_tensor(cached_latents.shape, generator=gen,
                          device=state.device, dtype=state.dtype)
     latents = scheduler.add_noise(cached_latents, noise, latent_timestep)
+
+    # H-space hook: add offset to mid-block output during denoising
+    h_handle = None
+    if h_offset is not None:
+        def _h_space_hook(module, input, output):
+            return output + h_offset.to(dtype=output.dtype, device=output.device)
+        h_handle = unet.mid_block.register_forward_hook(_h_space_hook)
 
     # UNet denoising loop (no CFG — guidance_scale=0.0)
     # IP-Adapter: ramp scale from 0 (early/noisy → text drives structure)
@@ -347,6 +363,9 @@ def _fast_img2img(cached_latents, prompt_embeds, pooled_prompt_embeds,
         latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
         if latents.dtype != state.dtype:
             latents = latents.to(state.dtype)
+
+    if h_handle is not None:
+        h_handle.remove()
 
     # Capture raw UNet latents before VAE decode (for reuse as cached_latents)
     raw_latents = latents.clone() if return_latents else None
@@ -395,6 +414,10 @@ def api_reset():
         state.direction3_pooled = None
         state.start_term3 = None
         state.end_term3 = None
+        state.h_direction1 = None
+        state.h_direction2 = None
+        state.h_direction3 = None
+        state.editing_space = "clip"
     return {"status": "ok"}
 
 
@@ -638,6 +661,96 @@ def _orthogonalise(d: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return (df - ((df * rf).sum() / r_sq) * rf).reshape_as(d)
 
 
+def _capture_h_space(prompt_embeds, pooled_prompt_embeds, time_ids,
+                     cached_latents, strength, num_steps, seed):
+    """Run a single denoising pass and capture UNet mid-block activation.
+
+    Returns the mid-block output tensor (h-space representation).
+    """
+    pipe = state.txt2img
+    scheduler = pipe.scheduler
+    unet = pipe.unet
+
+    activations = {}
+
+    def capture_hook(module, input, output):
+        activations["mid"] = output
+
+    handle = unet.mid_block.register_forward_hook(capture_hook)
+
+    try:
+        scheduler.set_timesteps(num_steps, device=state.device)
+        init_timestep = min(int(num_steps * strength), num_steps)
+        t_start = max(num_steps - init_timestep, 0)
+        timesteps = scheduler.timesteps[t_start:]
+        latent_timestep = timesteps[:1]
+
+        gen = torch.Generator(device=state.device)
+        gen.manual_seed(seed)
+        from diffusers.utils.torch_utils import randn_tensor as _randn
+        noise = _randn(cached_latents.shape, generator=gen,
+                       device=state.device, dtype=state.dtype)
+        latents = scheduler.add_noise(cached_latents, noise, latent_timestep)
+
+        added_cond_kwargs = {
+            "text_embeds": pooled_prompt_embeds,
+            "time_ids": time_ids,
+        }
+        if state.ip_adapter_embeds is not None:
+            added_cond_kwargs["image_embeds"] = state.ip_adapter_embeds
+            pipe.set_ip_adapter_scale(0.0)
+
+        # Run just the first timestep to capture h-space
+        t = timesteps[0]
+        model_input = scheduler.scale_model_input(latents, t)
+        unet(model_input, t,
+             encoder_hidden_states=prompt_embeds,
+             added_cond_kwargs=added_cond_kwargs,
+             return_dict=False)
+
+        return activations["mid"].clone()
+    finally:
+        handle.remove()
+
+
+def _compute_h_direction(start_term: str, end_term: str):
+    """Compute direction in UNet h-space (mid-block bottleneck).
+
+    Runs two forward passes with different prompts and returns the
+    difference in mid-block activations.
+    """
+    ctx = state.base_prompt or ""
+    cached_latents = state.base_latents_512
+    time_ids = state.time_ids_512
+    strength = 0.8
+    num_steps = 3
+    seed = 42
+
+    with torch.inference_mode():
+        # Forward pass with start-term-modified prompt
+        start_embeds, start_pooled = encode_prompt(f"{ctx}, {start_term}")
+        h_start = _capture_h_space(
+            start_embeds.to(dtype=state.dtype, device=state.device),
+            start_pooled.to(dtype=state.dtype, device=state.device),
+            time_ids, cached_latents, strength, num_steps, seed)
+
+        # Forward pass with end-term-modified prompt
+        end_embeds, end_pooled = encode_prompt(f"{ctx}, {end_term}")
+        h_end = _capture_h_space(
+            end_embeds.to(dtype=state.dtype, device=state.device),
+            end_pooled.to(dtype=state.dtype, device=state.device),
+            time_ids, cached_latents, strength, num_steps, seed)
+
+    h_dir = h_end - h_start
+    # Scale h-direction so ‖h_dir‖ = _DIRECTION_SCALE × ‖h_start‖
+    h_norm = h_dir.norm()
+    base_norm = h_start.norm()
+    if h_norm > 1e-8:
+        h_dir = h_dir * (_DIRECTION_SCALE * base_norm / h_norm)
+
+    return h_dir
+
+
 def _compute_direction(start_term: str, end_term: str, confinement: float):
     """Encode start/end terms and return (dir_embeds, dir_pooled) with confinement applied."""
     ctx = state.base_prompt or ""
@@ -781,6 +894,7 @@ class ExploreRequest(BaseModel):
     confinement: float = 0.5
     tx: float = 0.0   # current canvas position (for rebasing)
     ty: float = 0.0
+    editing_space: str = "clip"  # "clip" or "hspace"
 
 
 @app.post("/api/set_explore")
@@ -866,6 +980,24 @@ def api_set_explore(req: ExploreRequest):
             state.direction2_pooled = _orthogonalise(
                 state.direction2_pooled, state.direction_pooled)
 
+        # H-space: compute directions in UNet mid-block bottleneck
+        state.editing_space = req.editing_space
+        if req.editing_space == "hspace":
+            if req.left_term and req.right_term:
+                state.h_direction1 = _compute_h_direction(req.left_term, req.right_term)
+            else:
+                state.h_direction1 = None
+            if req.bottom_term and req.top_term:
+                state.h_direction2 = _compute_h_direction(req.bottom_term, req.top_term)
+            else:
+                state.h_direction2 = None
+            # Orthogonalise h-directions too
+            if state.h_direction1 is not None and state.h_direction2 is not None:
+                state.h_direction2 = _orthogonalise(state.h_direction2, state.h_direction1)
+        else:
+            state.h_direction1 = None
+            state.h_direction2 = None
+
     return {"status": "ok"}
 
 
@@ -919,10 +1051,22 @@ def api_interpolate2d(req: Interpolate2DRequest):
         interp_e = _renorm(interp_e, state.base_embeds).to(dtype=state.dtype, device=state.device)
         interp_p = _renorm(interp_p, state.base_pooled).to(dtype=state.dtype, device=state.device)
 
+        # Compute h-space offset if in hspace editing mode
+        h_offset = None
+        if state.editing_space == "hspace":
+            h_offset = torch.zeros_like(state.h_direction1) if state.h_direction1 is not None else None
+            if state.h_direction1 is not None:
+                h_offset = req.tx * state.h_direction1
+            if state.h_direction2 is not None:
+                h_offset = (h_offset if h_offset is not None else 0) + req.ty * state.h_direction2
+            if state.h_direction3 is not None:
+                h_offset = (h_offset if h_offset is not None else 0) + req.tz * state.h_direction3
+
         with torch.inference_mode():
             img = _fast_img2img(cached_latents, interp_e, interp_p,
                                 steps, strength, req.seed, time_ids,
-                                subject_lock=req.subject_lock)
+                                subject_lock=req.subject_lock,
+                                h_offset=h_offset)
 
     state.current_image = img
     buf = io.BytesIO()
