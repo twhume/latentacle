@@ -368,6 +368,36 @@ def _fast_img2img(cached_latents, prompt_embeds, pooled_prompt_embeds,
 # API — status
 # ---------------------------------------------------------------------------
 
+@app.post("/api/reset")
+def api_reset():
+    """Clear all session state (base image, directions, etc.)."""
+    with state.lock:
+        state.base_image = None
+        state.base_image_256 = None
+        state.current_image = None
+        state.base_prompt = None
+        state.base_embeds = None
+        state.base_pooled = None
+        state.base_latents_512 = None
+        state.base_latents_256 = None
+        state.time_ids_512 = None
+        state.time_ids_256 = None
+        state.ip_adapter_embeds = None
+        state.direction_embeds = None
+        state.direction_pooled = None
+        state.start_term = None
+        state.end_term = None
+        state.direction2_embeds = None
+        state.direction2_pooled = None
+        state.start_term2 = None
+        state.end_term2 = None
+        state.direction3_embeds = None
+        state.direction3_pooled = None
+        state.start_term3 = None
+        state.end_term3 = None
+    return {"status": "ok"}
+
+
 @app.get("/api/status")
 def api_status():
     return {
@@ -598,6 +628,16 @@ def _project_out_base(direction: torch.Tensor, base: torch.Tensor,
     return (d - strength * parallel).reshape_as(direction)
 
 
+def _orthogonalise(d: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """Remove ref's component from d (Gram-Schmidt).  Returns d with same shape."""
+    df = d.flatten()
+    rf = ref.flatten()
+    r_sq = (rf * rf).sum()
+    if r_sq < 1e-8:
+        return d
+    return (df - ((df * rf).sum() / r_sq) * rf).reshape_as(d)
+
+
 def _compute_direction(start_term: str, end_term: str, confinement: float):
     """Encode start/end terms and return (dir_embeds, dir_pooled) with confinement applied."""
     ctx = state.base_prompt or ""
@@ -749,33 +789,18 @@ def api_set_explore(req: ExploreRequest):
     require_base_image()
 
     with state.lock:
-        # Rebase: promote current position to new origin.
-        # Arithmetic rebase (add direction vectors) drifts off the CLIP
-        # manifold after repeated applications.  We blend the arithmetic
-        # result with a fresh CLIP re-encoding of the accumulated prompt
-        # to snap back toward the trained manifold while preserving the
-        # approximate semantic position.
+        # Rebase: keep the current image the user is looking at, but
+        # refresh text embeddings and latents so they're consistent.
+        #
+        # - base_image / base_latents ← current image (preserves visual)
+        # - base_embeds / base_pooled ← fresh CLIP encode of accumulated
+        #   prompt (stays on-manifold)
+        # - ip_adapter_embeds ← re-encode current image (anchors subject)
+        #
+        # The text/latent pairing isn't perfect, but the small mismatch
+        # is tolerable: at t≈0 the latent structure dominates, and as t
+        # grows the text conditioning gradually steers.
         if req.tx != 0.0 or req.ty != 0.0:
-            log.info("Rebase: tx=%.2f ty=%.2f", req.tx, req.ty)
-            arith_e = state.base_embeds.clone()
-            arith_p = state.base_pooled.clone()
-            if state.direction_embeds is not None:
-                arith_e = arith_e + req.tx * state.direction_embeds
-                arith_p = arith_p + req.tx * state.direction_pooled
-            if state.direction2_embeds is not None:
-                arith_e = arith_e + req.ty * state.direction2_embeds
-                arith_p = arith_p + req.ty * state.direction2_pooled
-            arith_e = _renorm(arith_e, state.base_embeds)
-            arith_p = _renorm(arith_p, state.base_pooled)
-
-            # Keep original txt2img latents — any derived latents (VAE
-            # re-encode or img2img) cause cartoon-style drift.  Update
-            # base_image for the t=0 display shortcut only.
-            if state.current_image is not None:
-                state.base_image = state.current_image
-
-            # Update prompt context so subsequent _compute_direction
-            # encodes terms relative to the current semantic position.
             terms = []
             if abs(req.tx) >= 0.5 and state.start_term is not None:
                 terms.append(state.end_term if req.tx > 0 else state.start_term)
@@ -783,19 +808,29 @@ def api_set_explore(req: ExploreRequest):
                 terms.append(state.end_term2 if req.ty > 0 else state.start_term2)
             if terms:
                 state.base_prompt = state.base_prompt + ", " + ", ".join(terms)
-            log.info("Rebase: prompt context now %r", state.base_prompt)
+            log.info("Rebase: prompt=%r, keeping current image", state.base_prompt)
 
-            # Manifold correction: blend arithmetic result with fresh CLIP
-            # encoding of the accumulated prompt.  This prevents multi-rebase
-            # drift while keeping the semantic position approximately right.
-            _REBASE_BLEND = 0.5  # 0 = pure arithmetic, 1 = pure re-encode
-            fresh_e, fresh_p = encode_prompt(state.base_prompt)
-            state.base_embeds = _renorm(
-                (1 - _REBASE_BLEND) * arith_e + _REBASE_BLEND * fresh_e,
-                arith_e)
-            state.base_pooled = _renorm(
-                (1 - _REBASE_BLEND) * arith_p + _REBASE_BLEND * fresh_p,
-                arith_p)
+            # Preserve current image as new base
+            img = state.current_image if state.current_image is not None else state.base_image
+            state.base_image = img
+
+            # Fresh CLIP text encoding (on-manifold)
+            state.base_embeds, state.base_pooled = encode_prompt(state.base_prompt)
+
+            # VAE-encode current image for matching latents
+            with torch.inference_mode():
+                state.base_latents_512 = _encode_image_to_latents(state.txt2img, img)
+            state.time_ids_512 = _build_time_ids(512, 512)
+
+            # Re-anchor IP-Adapter to current image
+            with torch.no_grad():
+                state.ip_adapter_embeds = state.txt2img.prepare_ip_adapter_image_embeds(
+                    ip_adapter_image=[img],
+                    ip_adapter_image_embeds=None,
+                    device=state.device,
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=False,
+                )
 
         # Axis 1 (left/right) — set or clear
         if req.left_term and req.right_term:
@@ -820,6 +855,16 @@ def api_set_explore(req: ExploreRequest):
             state.direction2_pooled = None
             state.start_term2 = None
             state.end_term2   = None
+
+        # Orthogonalise: remove axis-1 component from axis-2 so
+        # dragging X doesn't shift Y and vice versa.
+        # Don't rescale — the reduced magnitude after projection is
+        # correct (less independent variation = smaller effect).
+        if state.direction_embeds is not None and state.direction2_embeds is not None:
+            state.direction2_embeds = _orthogonalise(
+                state.direction2_embeds, state.direction_embeds)
+            state.direction2_pooled = _orthogonalise(
+                state.direction2_pooled, state.direction_pooled)
 
     return {"status": "ok"}
 
