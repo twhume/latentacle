@@ -115,7 +115,7 @@
   <div id="app">
 
     <header>
-      <img src="/static/logo.png" alt="Latentacle" style="height:72px;vertical-align:middle" />
+      <img src="/static/logo.png?v=2" alt="Latentacle" style="height:60px;vertical-align:middle" />
       <div style="display:flex;align-items:center;gap:0.6rem;">
         <a href="/pong" class="nav-link">Pong ↗</a>
         <div id="status-badge" class="badge loading">Loading model…</div>
@@ -147,11 +147,11 @@
     <section class="card disabled" id="axis-row">
       <div class="row">
         <span class="axis-label">X</span>
-        <input id="left-term"   type="text" placeholder="left…"   autocomplete="off" />
-        <input id="right-term"  type="text" placeholder="right…"  autocomplete="off" />
+        <input id="left-term"   type="text" placeholder="less… (optional)"  autocomplete="off" />
+        <input id="right-term"  type="text" placeholder="more…"             autocomplete="off" />
         <span class="axis-label" style="margin-left:0.5rem">Y</span>
-        <input id="bottom-term" type="text" placeholder="bottom…" autocomplete="off" />
-        <input id="top-term"    type="text" placeholder="top…"    autocomplete="off" />
+        <input id="bottom-term" type="text" placeholder="less… (optional)"  autocomplete="off" />
+        <input id="top-term"    type="text" placeholder="more…"             autocomplete="off" />
         <button id="set-btn" disabled>Set axes</button>
         <button id="clear-btn" style="background:transparent;border:1px solid var(--border);color:var(--muted);font-weight:400">Clear</button>
       </div>
@@ -208,6 +208,6 @@
     </section>
 
   </div>
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=7"></script>
 </body>
 </html>

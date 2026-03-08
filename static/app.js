@@ -291,16 +291,11 @@ setBtn.addEventListener("click", async () => {
   const bottom = bottomIn.value.trim();
   const top    = topIn.value.trim();
 
-  const hasX = left && right;
-  const hasY = bottom && top;
+  const hasX = !!right;   // left is optional (opposite direction)
+  const hasY = !!top;     // bottom is optional (opposite direction)
 
   if (!hasX && !hasY) {
-    // Need at least one complete pair — focus the missing field
-    if (left && !right) { rightIn.focus(); return; }
-    if (right && !left) { leftIn.focus(); return; }
-    if (bottom && !top) { topIn.focus(); return; }
-    if (top && !bottom) { bottomIn.focus(); return; }
-    leftIn.focus();
+    rightIn.focus();
     return;
   }
 
@@ -315,6 +310,7 @@ setBtn.addEventListener("click", async () => {
       bottom_term: bottom, top_term: top,
       confinement: parseInt(confinementSlider.value, 10) / 100,
       tx, ty,
+      editing_space: "hspace",
     });
     axisXReady = hasX;
     axisYReady = hasY;
@@ -504,7 +500,7 @@ async function renderImage(tx, ty, cx, cy) {
     rendered = { x: cx, y: cy };
     draw();
   } catch (e) {
-    // silently swallow
+    console.error("renderImage failed:", e);
   } finally {
     interpStatus.textContent = "";
     interpBusy = false;

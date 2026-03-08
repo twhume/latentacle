@@ -92,7 +92,7 @@ class State:
         self.h_direction1: Optional[torch.Tensor] = None  # axis 1
         self.h_direction2: Optional[torch.Tensor] = None  # axis 2
         self.h_direction3: Optional[torch.Tensor] = None  # axis 3
-        self.editing_space: str = "clip"  # "clip" or "hspace"
+        self.editing_space: str = "hspace"  # "clip" or "hspace"
 
         # Recording state
         self.recording_frames: list = []
@@ -417,7 +417,7 @@ def api_reset():
         state.h_direction1 = None
         state.h_direction2 = None
         state.h_direction3 = None
-        state.editing_space = "clip"
+        state.editing_space = "hspace"
     return {"status": "ok"}
 
 
@@ -727,8 +727,11 @@ def _compute_h_direction(start_term: str, end_term: str):
     seed = 42
 
     with torch.inference_mode():
-        # Forward pass with start-term-modified prompt
-        start_embeds, start_pooled = encode_prompt(f"{ctx}, {start_term}")
+        # Forward pass with start-term-modified prompt (or base prompt if no start term)
+        if start_term:
+            start_embeds, start_pooled = encode_prompt(f"{ctx}, {start_term}")
+        else:
+            start_embeds, start_pooled = state.base_embeds, state.base_pooled
         h_start = _capture_h_space(
             start_embeds.to(dtype=state.dtype, device=state.device),
             start_pooled.to(dtype=state.dtype, device=state.device),
@@ -752,13 +755,20 @@ def _compute_h_direction(start_term: str, end_term: str):
 
 
 def _compute_direction(start_term: str, end_term: str, confinement: float):
-    """Encode start/end terms and return (dir_embeds, dir_pooled) with confinement applied."""
+    """Encode start/end terms and return (dir_embeds, dir_pooled) with confinement applied.
+
+    If start_term is empty, the base prompt embedding is used as the start
+    point — the direction becomes "more of end_term" vs "less of end_term".
+    """
     ctx = state.base_prompt or ""
-    start_e, start_p = _mean_encode([
-        f"{ctx}, {start_term}",
-        f"{ctx}, in {start_term}",
-        f"{ctx}, {start_term} style",
-    ])
+    if start_term:
+        start_e, start_p = _mean_encode([
+            f"{ctx}, {start_term}",
+            f"{ctx}, in {start_term}",
+            f"{ctx}, {start_term} style",
+        ])
+    else:
+        start_e, start_p = state.base_embeds, state.base_pooled
     end_e, end_p = _mean_encode([
         f"{ctx}, {end_term}",
         f"{ctx}, in {end_term}",
@@ -894,7 +904,7 @@ class ExploreRequest(BaseModel):
     confinement: float = 0.5
     tx: float = 0.0   # current canvas position (for rebasing)
     ty: float = 0.0
-    editing_space: str = "clip"  # "clip" or "hspace"
+    editing_space: str = "hspace"  # "clip" or "hspace"
 
 
 @app.post("/api/set_explore")
@@ -947,10 +957,11 @@ def api_set_explore(req: ExploreRequest):
                 )
 
         # Axis 1 (left/right) — set or clear
-        if req.left_term and req.right_term:
+        # At least right_term is needed; left_term is optional (defaults to base prompt)
+        if req.right_term:
             state.direction_embeds, state.direction_pooled = _compute_direction(
                 req.left_term, req.right_term, req.confinement)
-            state.start_term = req.left_term
+            state.start_term = req.left_term or None
             state.end_term   = req.right_term
         else:
             state.direction_embeds = None
@@ -959,10 +970,11 @@ def api_set_explore(req: ExploreRequest):
             state.end_term   = None
 
         # Axis 2 (bottom/top) — set or clear
-        if req.bottom_term and req.top_term:
+        # At least top_term is needed; bottom_term is optional (defaults to base prompt)
+        if req.top_term:
             state.direction2_embeds, state.direction2_pooled = _compute_direction(
                 req.bottom_term, req.top_term, req.confinement)
-            state.start_term2 = req.bottom_term
+            state.start_term2 = req.bottom_term or None
             state.end_term2   = req.top_term
         else:
             state.direction2_embeds = None
@@ -983,11 +995,11 @@ def api_set_explore(req: ExploreRequest):
         # H-space: compute directions in UNet mid-block bottleneck
         state.editing_space = req.editing_space
         if req.editing_space == "hspace":
-            if req.left_term and req.right_term:
+            if req.right_term:
                 state.h_direction1 = _compute_h_direction(req.left_term, req.right_term)
             else:
                 state.h_direction1 = None
-            if req.bottom_term and req.top_term:
+            if req.top_term:
                 state.h_direction2 = _compute_h_direction(req.bottom_term, req.top_term)
             else:
                 state.h_direction2 = None
