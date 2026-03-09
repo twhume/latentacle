@@ -68,11 +68,29 @@
     }
     #history-strip {
       display: flex;
-      gap: 0.35rem;
-      overflow-x: auto;
+      flex-direction: column;
+      gap: 0;
       padding: 0.3rem 0;
     }
     #history-strip:empty { display: none; }
+    .hist-session {
+      border-top: 1px solid var(--border);
+      padding: 0.3rem 0 0.2rem;
+    }
+    .hist-session:first-child { border-top: none; }
+    .hist-session-label {
+      font-size: 0.65rem;
+      color: var(--muted);
+      padding: 0 0 0.2rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .hist-session-thumbs {
+      display: flex;
+      gap: 0.35rem;
+      overflow-x: auto;
+    }
     .hist-thumb {
       position: relative;
       flex-shrink: 0;
@@ -208,6 +226,6 @@
     </section>
 
   </div>
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/app.js?v=9"></script>
 </body>
 </html>

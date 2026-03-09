@@ -522,7 +522,7 @@ saveBtn.addEventListener("click", async () => {
       tx, ty,
       confinement: parseInt(confinementSlider.value, 10) / 100,
     });
-    addHistoryThumb(data.id, data.thumb);
+    addHistoryThumb(data.id, data.thumb, data.session_no, data.prompt);
   } catch (e) {
     setError(e.message);
   } finally {
@@ -541,7 +541,41 @@ downloadBtn.addEventListener("click", () => {
   document.body.removeChild(a);
 });
 
-function addHistoryThumb(id, thumbB64) {
+function _getOrCreateSessionGroup(sessionNo, prompt) {
+  let group = historyStrip.querySelector(`.hist-session[data-session="${sessionNo}"]`);
+  if (!group) {
+    group = document.createElement("div");
+    group.className = "hist-session";
+    group.dataset.session = sessionNo;
+
+    const label = document.createElement("div");
+    label.className = "hist-session-label";
+    label.textContent = prompt || "(no prompt)";
+    group.appendChild(label);
+
+    const thumbs = document.createElement("div");
+    thumbs.className = "hist-session-thumbs";
+    group.appendChild(thumbs);
+
+    // Insert in order: newest session first
+    const existing = historyStrip.querySelectorAll(".hist-session");
+    let inserted = false;
+    for (const el of existing) {
+      if (parseInt(el.dataset.session) < sessionNo) {
+        historyStrip.insertBefore(group, el);
+        inserted = true;
+        break;
+      }
+    }
+    if (!inserted) historyStrip.appendChild(group);
+  }
+  return group;
+}
+
+function addHistoryThumb(id, thumbB64, sessionNo, prompt) {
+  const group = _getOrCreateSessionGroup(sessionNo, prompt);
+  const thumbs = group.querySelector(".hist-session-thumbs");
+
   const div = document.createElement("div");
   div.className = "hist-thumb";
   div.dataset.id = id;
@@ -558,14 +592,16 @@ function addHistoryThumb(id, thumbB64) {
     try {
       await fetch(`/api/history/${id}`, { method: "DELETE" });
       div.remove();
+      // Remove empty session group
+      if (!thumbs.children.length) group.remove();
     } catch (_) {}
   });
   div.appendChild(del);
 
   div.addEventListener("click", () => restoreHistory(id));
 
-  // Insert at the start (most recent first)
-  historyStrip.prepend(div);
+  // Newest thumb on the left within its session
+  thumbs.prepend(div);
 }
 
 async function restoreHistory(id) {
@@ -617,7 +653,7 @@ async function loadHistory() {
     // Items come newest-first from the API; addHistoryThumb prepends,
     // so iterate in reverse to end up with newest on the left.
     for (let i = items.length - 1; i >= 0; i--) {
-      addHistoryThumb(items[i].id, items[i].thumb);
+      addHistoryThumb(items[i].id, items[i].thumb, items[i].session_no, items[i].prompt);
     }
   } catch (_) {}
 }

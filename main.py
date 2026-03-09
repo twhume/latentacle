@@ -93,6 +93,7 @@ class State:
         self.h_direction2: Optional[torch.Tensor] = None  # axis 2
         self.h_direction3: Optional[torch.Tensor] = None  # axis 3
         self.editing_space: str = "hspace"  # "clip" or "hspace"
+        self.session_no: int = 0  # incremented on each /api/generate
 
         # Recording state
         self.recording_frames: list = []
@@ -135,6 +136,7 @@ def _init_db():
         "bottom_term TEXT DEFAULT ''",
         "top_term TEXT DEFAULT ''",
         "confinement REAL DEFAULT 0.5",
+        "session_no INTEGER DEFAULT 0",
     ]:
         try:
             db.execute(f"ALTER TABLE history ADD COLUMN {col}")
@@ -467,6 +469,7 @@ class GenerateRequest(BaseModel):
 def api_generate(req: GenerateRequest):
     require_model()
     with state.lock:
+        state.session_no += 1
         gen = torch.Generator(device=state.device)
         gen.manual_seed(req.seed if req.seed is not None else random.randint(0, 2**32 - 1))
 
@@ -552,6 +555,7 @@ async def api_upload(request: Request):
     prompt = request.query_params.get("prompt", "")
 
     with state.lock:
+        state.session_no += 1
         state.base_image = img
         state.base_prompt = prompt
         state.current_image = img
@@ -1127,10 +1131,11 @@ def api_history_save(req: HistorySaveRequest):
         cur = db.execute(
             """INSERT INTO history
                (prompt, image_png, thumb_jpeg, base_image_png,
-                tx, ty, left_term, right_term, bottom_term, top_term, confinement)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                tx, ty, left_term, right_term, bottom_term, top_term, confinement, session_no)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (prompt, png_bytes, thumb_bytes, base_png_bytes,
-             req.tx, req.ty, left_term, right_term, bottom_term, top_term, req.confinement),
+             req.tx, req.ty, left_term, right_term, bottom_term, top_term, req.confinement,
+             state.session_no),
         )
         db.commit()
         row = db.execute(
@@ -1141,13 +1146,15 @@ def api_history_save(req: HistorySaveRequest):
         "id": row[0],
         "created_at": row[1],
         "thumb": base64.b64encode(thumb_bytes).decode(),
+        "session_no": state.session_no,
+        "prompt": prompt,
     }
 
 
 @app.get("/api/history")
 def api_history_list():
     rows = db.execute(
-        "SELECT id, prompt, created_at, thumb_jpeg FROM history ORDER BY id DESC"
+        "SELECT id, prompt, created_at, thumb_jpeg, session_no FROM history ORDER BY id DESC"
     ).fetchall()
     return [
         {
@@ -1155,6 +1162,7 @@ def api_history_list():
             "prompt": r[1],
             "created_at": r[2],
             "thumb": base64.b64encode(r[3]).decode(),
+            "session_no": r[4] or 0,
         }
         for r in rows
     ]
